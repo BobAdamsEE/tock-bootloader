@@ -38,20 +38,19 @@ const DFU_DBL_RESET_MAGIC: u32 = 0x5A1AD5;
 
 /// Memory location we use as a flag for detecting a double reset.
 ///
-/// I have no idea why we use address 0x20007F7C, but that is what the Adafruit
-/// nRF52 bootloader uses, so I copied it.
+/// This is in the last 16 bytes of RAM and retained via a linker file
 const DOUBLE_RESET_MEMORY_LOCATION: StaticRef<VolatileCell<u32>> =
-    unsafe { StaticRef::new(0x20007F7C as *const VolatileCell<u32>) };
+    unsafe { StaticRef::new(0x2005FFF0 as *const VolatileCell<u32>) };
 
 pub struct BootloaderEntryGpRegRet {
-    nrf_power: &'static nrf52::power::Power<'static>,
+    samv71_gpbr: &'static samv71q21b::gpbr::Gpbr,
     double_reset: StaticRef<VolatileCell<u32>>,
 }
 
 impl BootloaderEntryGpRegRet {
-    pub fn new(nrf_power: &'static nrf52::power::Power<'static>) -> BootloaderEntryGpRegRet {
+    pub fn new(samv71_gpbr: &'static samv71q21b::Gpbr) -> BootloaderEntryGpRegRet {
         BootloaderEntryGpRegRet {
-            nrf_power,
+            samv71_gpbr,
             double_reset: DOUBLE_RESET_MEMORY_LOCATION,
         }
     }
@@ -65,16 +64,16 @@ impl bootloader::interfaces::BootloaderEntry for BootloaderEntryGpRegRet {
         // bootloader. We also allow bootloader chaining
         if self.nrf_power.get_gpregret() >= DFU_MAGIC_TOCK_BOOTLOADER1 {
             // Clear flag so we do not get stuck in the bootloader.
-            self.nrf_power.set_gpregret(0);
+            self.samv71_gpbr.set_gpregret(GpbrIndex::Gpbr7, 0);
 
             return true;
         }
 
         // Check if this is the second bootloader. If so, we want to stay in the
         // bootloader unconditionally.
-        if self.nrf_power.get_gpregret() >= DFU_MAGIC_TOCK_BOOTLOADER2 {
+        if self.samv71_gpbr.get_gpregret(Gpbr7) >= DFU_MAGIC_TOCK_BOOTLOADER2 {
             // Clear flag so we do not get stuck in the bootloader.
-            self.nrf_power.set_gpregret(0);
+            self.samv71_gpbr.set_gpregret(GpbrIndex::Gpbr7, 0);
 
             return true;
         }
@@ -96,13 +95,13 @@ impl bootloader::interfaces::BootloaderEntry for BootloaderEntryGpRegRet {
         // bootloader will restart and the check above should trigger.
         self.double_reset.set(DFU_DBL_RESET_MAGIC);
         for _ in 0..2000000 {
-            cortexm4::support::nop();
+            cortexm7::support::nop();
         }
         self.double_reset.set(0);
 
         // Set so that we will stick in the second bootloader if they are
         // chained.
-        self.nrf_power.set_gpregret(DFU_MAGIC_TOCK_BOOTLOADER2);
+        self.samv71_gpbr.set_gpregret(GpbrIndex::Gpbr7,DFU_MAGIC_TOCK_BOOTLOADER2);
 
         // Default to jumping out of the bootloader.
         false

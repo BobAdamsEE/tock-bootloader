@@ -10,10 +10,9 @@ const DFU_DBL_RESET_MAGIC: u32 = 0x5A1AD5;
 
 /// Memory location we use as a flag for detecting a double reset.
 ///
-/// I have no idea why we use address 0x20007F7C, but that is what the Adafruit
-/// nRF52 bootloader uses, so I copied it.
+/// This is in the last 16 bytes of RAM and retained via a linker file
 const DOUBLE_RESET_MEMORY_LOCATION: StaticRef<VolatileCell<u32>> =
-    unsafe { StaticRef::new(0x20007F7C as *const VolatileCell<u32>) };
+    unsafe { StaticRef::new(0x2005FFF0 as *const VolatileCell<u32>) };
 
 pub struct BootloaderEntryDoubleReset {
     double_reset: StaticRef<VolatileCell<u32>>,
@@ -46,7 +45,7 @@ impl bootloader::interfaces::BootloaderEntry for BootloaderEntryDoubleReset {
         // bootloader will restart and the check above should trigger.
         self.double_reset.set(DFU_DBL_RESET_MAGIC);
         for _ in 0..2000000 {
-            cortexm4::support::nop();
+            cortexm7::support::nop();
         }
         self.double_reset.set(0);
 

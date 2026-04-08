@@ -6,7 +6,7 @@ edition = "2021"
 
 [dependencies]
 kernel = { git = "https://github.com/tock/tock", rev = "2ff6868" }
-samv71q21b = { git = "https://github.com/BobAdamsEE/tock/", rev = "33a6fda" }
+samv71q21b = { git = "https://github.com/BobAdamsEE/tock/", rev = "c0d2b56" }
 cortexm7 = { git = "https://github.com/tock/tock", rev = "2ff6868" }
 
 #kernel = { path = "../../../tock/kernel" }
