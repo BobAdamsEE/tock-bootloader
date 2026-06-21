@@ -18,7 +18,9 @@ pub static mut BUF: [u8; 600] = [0; 600];
 
 // How long to wait, in bit periods, after receiving a byte for the next
 // byte before timing out and calling `receive_complete`.
-const UART_RECEIVE_TIMEOUT: u8 = 100;
+// At 16× oversampling and 115200 baud one byte takes 160 bit periods, so
+// the timeout must exceed that to avoid splitting multi-byte commands.
+const UART_RECEIVE_TIMEOUT: u8 = 250;
 
 // Get the addresses in flash of key components from the linker file.
 extern "C" {
@@ -96,7 +98,7 @@ impl<'a> BootloaderEnterer<'a> {
 
     pub fn check(&mut self) {
         if !self.entry_decider.stay_in_bootloader() {
-            // Jump to the kernel and start the real code.
+            // Jump to the kernel and start the real code (or stay if no kernel).
             self.jump();
         } else {
             // Staying in the bootloader, allow a custom active notification to
@@ -105,7 +107,7 @@ impl<'a> BootloaderEnterer<'a> {
         }
     }
 
-    fn jump(&self) {
+    fn jump(&mut self) {
         // Address of the start address in the flags region is 32 bytes from the start.
         let start_address_memory_location = self.bootloader_flags_address + 32;
 
@@ -113,6 +115,25 @@ impl<'a> BootloaderEnterer<'a> {
             unsafe { StaticRef::new(start_address_memory_location as *const VolatileCell<u32>) };
 
         let start_address = start_address_ptr.get();
+
+        // Validate start_address before dereferencing it. The kernel lives in
+        // the alias flash range [0x8000, 0x200000). Values outside this range
+        // mean the flags region has never been written (zeroed) or is fully
+        // erased (0xFFFFFFFF), so no kernel is installed.
+        if start_address < 0x0000_8000 || start_address >= 0x0020_0000 {
+            self.active_notifier.active();
+            return;
+        }
+
+        // Read the kernel's initial SP from its vector table to detect a kernel
+        // region that exists in the address space but has not been programmed.
+        // Erased flash reads as 0xFFFFFFFF which is not a valid stack pointer.
+        let kernel_sp_ptr: StaticRef<VolatileCell<u32>> =
+            unsafe { StaticRef::new(start_address as *const VolatileCell<u32>) };
+        if kernel_sp_ptr.get() == 0xFFFF_FFFF {
+            self.active_notifier.active();
+            return;
+        }
 
         self.jumper.jump(start_address);
     }
@@ -239,61 +260,50 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::ua
         rval: Result<(), ErrorCode>,
         _error: hil::uart::Error,
     ) {
-        if rval.is_err() {
+        if rval.is_err() || rx_len == 0 {
+            let _ = self
+                .uart
+                .receive_automatic(buffer, buffer.len(), UART_RECEIVE_TIMEOUT);
             return;
         }
 
-        // Tool to parse incoming bootloader messages.
-        // This is currently allocated on the stack, but it too needs a big
-        // buffer, and we need to do something about that.
         let mut decoder = tock_bootloader_protocol::CommandDecoder::new();
-        // Whether we want to reset the position in the buffer in the
-        // decoder.
         let mut need_reset = false;
+        let mut buf = Some(buffer);
 
-        // Loop through the buffer and pass it to the decoder.
         for i in 0..rx_len {
-            // Artifact of the original implementation of the bootloader
-            // protocol is the need to reset the pointer internal to the
-            // bootloader receive state machine. This is here because we may
-            // have received two commands in the same buffer and we want to
-            // handle them both back-to-back.
             if need_reset {
                 decoder.reset();
                 need_reset = false;
             }
 
-            match decoder.receive(buffer[i]) {
+            let byte = buf.as_ref().unwrap()[i];
+            match decoder.receive(byte) {
                 Ok(None) => {}
                 Ok(Some(tock_bootloader_protocol::Command::Ping)) => {
+                    let buffer = buf.take().unwrap();
                     self.buffer.replace(buffer);
                     self.send_response(RES_PONG);
                     break;
                 }
                 Ok(Some(tock_bootloader_protocol::Command::Reset)) => {
                     need_reset = true;
-                    // If there are more bytes in the buffer we want to continue
-                    // parsing those. Otherwise, we want to go back to receive.
                     if i == rx_len - 1 {
-                        let _ =
-                            self.uart
-                                .receive_automatic(buffer, buffer.len(), UART_RECEIVE_TIMEOUT);
                         break;
                     }
                 }
                 Ok(Some(tock_bootloader_protocol::Command::Info)) => {
+                    let buffer = buf.take().unwrap();
                     self.state.set(State::Info);
                     self.buffer.replace(buffer);
                     self.page_buffer.take().map(move |page| {
-                        // Calculate the page index given that flags start
-                        // at address 1024.
                         let page_index = self.flags_address / page.as_mut().len();
-
                         let _ = self.flash.read_page(page_index, page);
                     });
                     break;
                 }
                 Ok(Some(tock_bootloader_protocol::Command::ReadRange { address, length })) => {
+                    let buffer = buf.take().unwrap();
                     self.state.set(State::ReadRange {
                         address,
                         length,
@@ -307,11 +317,10 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::ua
                     break;
                 }
                 Ok(Some(tock_bootloader_protocol::Command::WritePage { address, data })) => {
+                    let buffer = buf.take().unwrap();
                     self.page_buffer.take().map(move |page| {
                         let page_size = page.as_mut().len();
                         if page_size != data.len() {
-                            // Error if we didn't get exactly a page of data
-                            // to write to flash.
                             buffer[0] = ESCAPE_CHAR;
                             buffer[1] = RES_BADARGS;
                             self.page_buffer.replace(page);
@@ -320,17 +329,12 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::ua
                         } else if address >= self.bootloader_address
                             && address < self.bootloader_end_address
                         {
-                            // Do not allow the bootloader to try to overwrite
-                            // itself. This will largely not work, and would be
-                            // irreversible for the user.
                             buffer[0] = ESCAPE_CHAR;
                             buffer[1] = RES_BADADDR;
                             self.page_buffer.replace(page);
                             self.state.set(State::Idle);
                             let _ = self.uart.transmit_buffer(buffer, 2);
                         } else {
-                            // Otherwise copy into page buffer and write to
-                            // flash.
                             for i in 0..page_size {
                                 page.as_mut()[i] = data[i];
                             }
@@ -342,6 +346,7 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::ua
                     break;
                 }
                 Ok(Some(tock_bootloader_protocol::Command::ErasePage { address })) => {
+                    let buffer = buf.take().unwrap();
                     self.state.set(State::ErasePage);
                     self.buffer.replace(buffer);
                     let page_size = self.page_buffer.map_or(512, |page| page.as_mut().len());
@@ -349,6 +354,7 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::ua
                     break;
                 }
                 Ok(Some(tock_bootloader_protocol::Command::CrcIntFlash { address, length })) => {
+                    let buffer = buf.take().unwrap();
                     self.state.set(State::Crc {
                         address,
                         remaining_length: length,
@@ -362,31 +368,25 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::ua
                     break;
                 }
                 Ok(Some(tock_bootloader_protocol::Command::GetAttr { index })) => {
+                    let buffer = buf.take().unwrap();
                     self.state.set(State::GetAttribute { index: index });
                     self.buffer.replace(buffer);
                     self.page_buffer.take().map(move |page| {
-                        // Need to calculate which page to read to get the
-                        // correct attribute (each attribute is 64 bytes long),
-                        // where attributes start at address 0x600.
                         let page_len = page.as_mut().len();
                         let read_address = self.attributes_address + (index as usize * 64);
                         let page_index = read_address / page_len;
-
                         let _ = self.flash.read_page(page_index, page);
                     });
                     break;
                 }
                 Ok(Some(tock_bootloader_protocol::Command::SetAttr { index, key, value })) => {
+                    let buffer = buf.take().unwrap();
                     self.state.set(State::SetAttribute { index });
-
-                    // Copy the key and value into the buffer so it can be added
-                    // to the page buffer when needed.
                     for i in 0..8 {
                         buffer[i] = key[i];
                     }
                     buffer[8] = value.len() as u8;
                     for i in 0..55 {
-                        // Copy in the value, otherwise clear to zero.
                         if i < value.len() {
                             buffer[9 + i] = value[i];
                         } else {
@@ -394,31 +394,21 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::ua
                         }
                     }
                     self.buffer.replace(buffer);
-
-                    // Initiate things by reading the correct flash page that
-                    // needs to be updated.
                     self.page_buffer.take().map(move |page| {
-                        // Need to calculate which page to read to get the
-                        // correct attribute (each attribute is 64 bytes long),
-                        // where attributes start at address 0x600.
                         let page_len = page.as_mut().len();
                         let read_address = self.attributes_address + (index as usize * 64);
                         let page_index = read_address / page_len;
-
                         let _ = self.flash.read_page(page_index, page);
                     });
                     break;
                 }
                 Ok(Some(tock_bootloader_protocol::Command::SetStartAddress { address })) => {
+                    let buffer = buf.take().unwrap();
                     self.state.set(State::SetStartAddress { address });
                     self.buffer.replace(buffer);
-
-                    // Initiate things by reading the correct flash page that
-                    // needs to be updated.
                     self.page_buffer.take().map(move |page| {
                         let page_len = page.as_mut().len();
                         let page_index = self.flags_address / page_len;
-
                         let _ = self.flash.read_page(page_index, page);
                     });
                     break;
@@ -428,16 +418,19 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::ua
                     break;
                 }
                 Ok(Some(_)) => {
+                    let buffer = buf.take().unwrap();
                     self.buffer.replace(buffer);
                     self.send_response(RES_UNKNOWN);
                     break;
                 }
                 Err(tock_bootloader_protocol::Error::BadArguments) => {
+                    let buffer = buf.take().unwrap();
                     self.buffer.replace(buffer);
                     self.send_response(RES_BADARGS);
                     break;
                 }
                 Err(_) => {
+                    let buffer = buf.take().unwrap();
                     self.buffer.replace(buffer);
                     self.send_response(RES_INTERNAL_ERROR);
                     break;
@@ -445,11 +438,10 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::ua
             };
         }
 
-        // Artifact of the original implementation of the bootloader protocol
-        // is the need to reset the pointer internal to the bootloader receive
-        // state machine.
-        if need_reset {
-            decoder.reset();
+        if let Some(buffer) = buf {
+            let _ = self
+                .uart
+                .receive_automatic(buffer, buffer.len(), UART_RECEIVE_TIMEOUT);
         }
     }
 }
@@ -457,7 +449,7 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::ua
 impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::flash::Client<F>
     for Bootloader<'a, U, F>
 {
-    fn read_complete(&self, pagebuffer: &'static mut F::Page, _error: hil::flash::Error) {
+    fn read_complete(&self, pagebuffer: &'static mut F::Page, _result: Result<(), hil::flash::Error>) {
         match self.state.get() {
             // We just read the bootloader info page (page 2). Extract the
             // version and generate a response JSON blob.
@@ -718,7 +710,7 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::fl
         }
     }
 
-    fn write_complete(&self, pagebuffer: &'static mut F::Page, _error: hil::flash::Error) {
+    fn write_complete(&self, pagebuffer: &'static mut F::Page, _result: Result<(), hil::flash::Error>) {
         self.page_buffer.replace(pagebuffer);
 
         match self.state.get() {
@@ -762,7 +754,7 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::fl
         }
     }
 
-    fn erase_complete(&self, _error: hil::flash::Error) {
+    fn erase_complete(&self, _result: Result<(), hil::flash::Error>) {
         match self.state.get() {
             // Page erased, return OK
             State::ErasePage => {

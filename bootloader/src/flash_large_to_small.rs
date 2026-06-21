@@ -50,7 +50,7 @@ enum State {
 
 pub struct FlashLargeToSmall<'a, Flarge: hil::flash::Flash + 'static> {
     flash_large: &'a Flarge,
-    client: OptionalCell<&'static dyn hil::flash::Client<FlashLargeToSmall<'static, Flarge>>>,
+    client: OptionalCell<&'a dyn hil::flash::Client<FlashLargeToSmall<'a, Flarge>>>,
     pagebuffer: TakeCell<'static, Flarge::Page>,
 
     client_pagebuffer: TakeCell<'static, FiveTwelvePage>,
@@ -81,10 +81,10 @@ impl<'a, Flarge: hil::flash::Flash> FlashLargeToSmall<'a, Flarge> {
     }
 }
 
-impl<'a, C: hil::flash::Client<Self>, Flarge: hil::flash::Flash> hil::flash::HasClient<'static, C>
-    for FlashLargeToSmall<'static, Flarge>
+impl<'a, C: hil::flash::Client<FlashLargeToSmall<'a, Flarge>>, Flarge: hil::flash::Flash>
+    hil::flash::HasClient<'a, C> for FlashLargeToSmall<'a, Flarge>
 {
-    fn set_client(&self, client: &'static C) {
+    fn set_client(&'a self, client: &'a C) {
         self.client.set(client);
     }
 }
@@ -97,13 +97,8 @@ impl<'a, Flarge: hil::flash::Flash> hil::flash::Flash for FlashLargeToSmall<'a, 
         page_number: usize,
         buf: &'static mut Self::Page,
     ) -> Result<(), (ErrorCode, &'static mut Self::Page)> {
-        // Translate to the large page we need to read.
         let (index, _) = self.get_large_page_index_offset(page_number);
-
-        // Save the buffer to read into.
         self.client_pagebuffer.replace(buf);
-
-        // Call the underlying flash layer.
         self.pagebuffer.take().map_or_else(
             || Err((ErrorCode::FAIL, self.client_pagebuffer.take().unwrap())),
             |page| {
@@ -121,13 +116,8 @@ impl<'a, Flarge: hil::flash::Flash> hil::flash::Flash for FlashLargeToSmall<'a, 
         page_number: usize,
         buf: &'static mut Self::Page,
     ) -> Result<(), (ErrorCode, &'static mut Self::Page)> {
-        // Translate to the large page we need to read.
         let (index, _) = self.get_large_page_index_offset(page_number);
-
-        // Save the buffer to write from.
         self.client_pagebuffer.replace(buf);
-
-        // Call the underlying flash layer to read the original large page.
         self.pagebuffer.take().map_or_else(
             || Err((ErrorCode::FAIL, self.client_pagebuffer.take().unwrap())),
             |page| {
@@ -141,10 +131,7 @@ impl<'a, Flarge: hil::flash::Flash> hil::flash::Flash for FlashLargeToSmall<'a, 
     }
 
     fn erase_page(&self, page_number: usize) -> Result<(), ErrorCode> {
-        // Translate to the large page we need to read.
         let (index, _) = self.get_large_page_index_offset(page_number);
-
-        // Call the underlying flash layer to read the original large page.
         self.pagebuffer.take().map_or(Err(ErrorCode::FAIL), |page| {
             self.state.set(State::Erase { page_number });
             match self.flash_large.read_page(index, page) {
@@ -158,12 +145,16 @@ impl<'a, Flarge: hil::flash::Flash> hil::flash::Flash for FlashLargeToSmall<'a, 
     }
 }
 
-impl<Flarge: hil::flash::Flash> hil::flash::Client<Flarge> for FlashLargeToSmall<'_, Flarge> {
-    fn read_complete(&self, pagebuffer: &'static mut Flarge::Page, _error: hil::flash::Error) {
+impl<'a, Flarge: hil::flash::Flash> hil::flash::Client<Flarge>
+    for FlashLargeToSmall<'a, Flarge>
+{
+    fn read_complete(
+        &self,
+        pagebuffer: &'static mut Flarge::Page,
+        _result: Result<(), hil::flash::Error>,
+    ) {
         match self.state.get() {
             State::Read { page_number } => {
-                // Just need to read from the larger page into the smaller page
-                // buffer.
                 let (_, large_page_offset) = self.get_large_page_index_offset(page_number);
                 let large_page_byte_offset = 512 * large_page_offset;
 
@@ -172,17 +163,13 @@ impl<Flarge: hil::flash::Flash> hil::flash::Client<Flarge> for FlashLargeToSmall
                         for i in 0..512 {
                             smpage[i] = pagebuffer.as_mut()[large_page_byte_offset + i];
                         }
-
                         self.pagebuffer.replace(pagebuffer);
-
-                        client.read_complete(smpage, hil::flash::Error::CommandComplete);
+                        client.read_complete(smpage, Ok(()));
                     });
                 });
             }
 
             State::Write { page_number } => {
-                // Need to copy the new data from the small page into the larger
-                // page.
                 let (large_page_index, large_page_offset) =
                     self.get_large_page_index_offset(page_number);
                 let large_page_byte_offset = 512 * large_page_offset;
@@ -191,21 +178,18 @@ impl<Flarge: hil::flash::Flash> hil::flash::Client<Flarge> for FlashLargeToSmall
                     for i in 0..512 {
                         pagebuffer.as_mut()[large_page_byte_offset + i] = smpage[i];
                     }
-
                     let _ = self.flash_large.write_page(large_page_index, pagebuffer);
                 });
             }
 
             State::Erase { page_number } => {
-                // Need to set the smaller page area with all 1s.
                 let (large_page_index, large_page_offset) =
                     self.get_large_page_index_offset(page_number);
                 let large_page_byte_offset = 512 * large_page_offset;
 
                 for i in 0..512 {
-                    pagebuffer.as_mut()[large_page_byte_offset + i] = 1;
+                    pagebuffer.as_mut()[large_page_byte_offset + i] = 0xFF;
                 }
-
                 let _ = self.flash_large.write_page(large_page_index, pagebuffer);
             }
 
@@ -213,14 +197,17 @@ impl<Flarge: hil::flash::Flash> hil::flash::Client<Flarge> for FlashLargeToSmall
         }
     }
 
-    fn write_complete(&self, pagebuffer: &'static mut Flarge::Page, _error: hil::flash::Error) {
+    fn write_complete(
+        &self,
+        pagebuffer: &'static mut Flarge::Page,
+        _result: Result<(), hil::flash::Error>,
+    ) {
         match self.state.get() {
             State::Write { page_number: _ } => {
                 self.client.map(|client| {
                     self.client_pagebuffer.take().map(move |smpage| {
                         self.pagebuffer.replace(pagebuffer);
-
-                        client.write_complete(smpage, hil::flash::Error::CommandComplete);
+                        client.write_complete(smpage, Ok(()));
                     });
                 });
             }
@@ -228,7 +215,7 @@ impl<Flarge: hil::flash::Flash> hil::flash::Client<Flarge> for FlashLargeToSmall
             State::Erase { page_number: _ } => {
                 self.pagebuffer.replace(pagebuffer);
                 self.client.map(|client| {
-                    client.erase_complete(hil::flash::Error::CommandComplete);
+                    client.erase_complete(Ok(()));
                 });
             }
 
@@ -236,5 +223,5 @@ impl<Flarge: hil::flash::Flash> hil::flash::Client<Flarge> for FlashLargeToSmall
         }
     }
 
-    fn erase_complete(&self, _error: hil::flash::Error) {}
+    fn erase_complete(&self, _result: Result<(), hil::flash::Error>) {}
 }

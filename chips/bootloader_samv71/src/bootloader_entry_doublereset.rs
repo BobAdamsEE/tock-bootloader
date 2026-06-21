@@ -10,9 +10,10 @@ const DFU_DBL_RESET_MAGIC: u32 = 0x5A1AD5;
 
 /// Memory location we use as a flag for detecting a double reset.
 ///
-/// This is in the last 16 bytes of RAM and retained via a linker file
+/// Last word of SAMV71Q21B SRAM (384 KB: 0x20400000–0x2045FFFF).
+/// Must be reserved by the linker script so it is not zeroed at startup.
 const DOUBLE_RESET_MEMORY_LOCATION: StaticRef<VolatileCell<u32>> =
-    unsafe { StaticRef::new(0x2005FFF0 as *const VolatileCell<u32>) };
+    unsafe { StaticRef::new(0x2045FFF0 as *const VolatileCell<u32>) };
 
 pub struct BootloaderEntryDoubleReset {
     double_reset: StaticRef<VolatileCell<u32>>,

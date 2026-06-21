@@ -1,0 +1,5 @@
+r
+loadbin samv71xplained-bootloader.bin, 0x00400000
+r
+g
+exit

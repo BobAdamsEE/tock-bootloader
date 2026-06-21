@@ -1,107 +1,89 @@
-//! Tock kernel for the bootloader on nrf52 over CDC/USB.
+//! Tock bootloader for the SAMV71 Xplained Ultra evaluation board.
 //!
-//! It is based on nRF52833 SoC (Cortex M4 core with a BLE + IEEE 802.15.4 transceiver).
+//! Hardware:
+//!   - ATSAMV71Q21B, Cortex-M7, 300 MHz PCK / 150 MHz MCK
+//!   - EDBG UART: USART1, RXD=PA21 (periph A), TXD=PB4 (periph D), 115200 baud
+//!   - 2 MB internal flash (512-byte pages), 384 KB SRAM at 0x20400000
+//!
+//! Bootloader entry (evaluated in order):
+//!   1. GPBR7 >= 0x90: kernel explicitly requested reboot into bootloader.
+//!   2. Double-reset: two resets within the detection window.
 
 #![no_std]
-// Disable this attribute when documenting, as a workaround for
-// https://github.com/rust-lang/rust/issues/62184.
 #![cfg_attr(not(doc), no_main)]
+
+mod flash_passthrough;
 
 use core::panic::PanicInfo;
 
 use kernel::capabilities;
-use kernel::component::Component;
 use kernel::hil;
-use kernel::hil::time::Alarm;
-use kernel::hil::time::Counter;
-use kernel::platform::KernelResources;
-use kernel::platform::SyscallDriverLookup;
+use kernel::platform::{KernelResources, SyscallDriverLookup};
+use kernel::process::ProcessSlot;
 use kernel::{create_capability, static_init};
 
 use bootloader::null_scheduler::NullScheduler;
 
-use capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm;
+use bootloader::bootloader_entry_always::BootloaderEntryAlways;
 
-use nrf52833::gpio::Pin;
-use nrf52833::interrupt_service::Nrf52833DefaultPeripherals;
+use samv71q21b::chip::{Atsamv71q21b, Atsamv71q21bDefaultPeripherals};
+use samv71q21b::efc::Efc;
+use samv71q21b::gpio::PeripheralFunction;
+use samv71q21b::pmc;
+use samv71q21b::uart::Usart1;
 
-const UART_TXD: Pin = Pin::P0_06;
-const UART_RXD: Pin = Pin::P1_08;
+// ---------------------------------------------------------------------------
+// Platform constants
+// ---------------------------------------------------------------------------
 
-const LED_ON_PIN: Pin = Pin::P0_20;
-const BUTTON_A: Pin = Pin::P0_14;
-
-include!(concat!(env!("OUT_DIR"), "/attributes.rs"));
-
-// Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 0;
 
-static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
-    [None; NUM_PROCS];
+static mut PROCESSES: [ProcessSlot; NUM_PROCS] = [];
 
-static mut CHIP: Option<&'static nrf52833::chip::NRF52<Nrf52833DefaultPeripherals>> = None;
+static mut CHIP: Option<&'static Atsamv71q21b<Atsamv71q21bDefaultPeripherals>> = None;
 
-/// Dummy buffer that causes the linker to reserve enough space for the stack.
+/// Reserve stack space (8 KB).
 #[no_mangle]
 #[link_section = ".stack_buffer"]
 pub static mut STACK_MEMORY: [u8; 0x2000] = [0; 0x2000];
 
-/// Function to allow the bootloader to exit by reseting the chip.
+// ---------------------------------------------------------------------------
+// Bootloader exit: reset the chip so it re-enters the entry check and then
+// jumps to the kernel (GPBR7 will be 0 at that point).
+// ---------------------------------------------------------------------------
 fn bootloader_exit() {
-    unsafe {
-        cortexm4::scb::reset();
-    }
+    unsafe { cortexm7::scb::reset(); }
 }
 
-/// Supported drivers by the platform
+// ---------------------------------------------------------------------------
+// Platform struct
+// ---------------------------------------------------------------------------
+
 pub struct Platform {
     bootloader: &'static bootloader::bootloader::Bootloader<
         'static,
-        bootloader::uart_receive_multiple_timeout::UartReceiveMultipleTimeout<
-            'static,
-            VirtualMuxAlarm<'static, nrf52::rtc::Rtc<'static>>,
-        >,
-        bootloader::flash_large_to_small::FlashLargeToSmall<'static, nrf52::nvmc::Nvmc>,
+        Usart1<'static>,
+        flash_passthrough::Sam71FlashDirect,
     >,
     scheduler: &'static NullScheduler,
 }
 
-impl KernelResources<nrf52833::chip::NRF52<'static, Nrf52833DefaultPeripherals<'static>>>
-    for Platform
-{
+impl KernelResources<Atsamv71q21b<Atsamv71q21bDefaultPeripherals>> for Platform {
     type SyscallDriverLookup = Self;
     type SyscallFilter = ();
     type ProcessFault = ();
-    type CredentialsCheckingPolicy = ();
     type Scheduler = NullScheduler;
     type SchedulerTimer = ();
     type WatchDog = ();
     type ContextSwitchCallback = ();
 
-    fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
-        &self
-    }
-    fn syscall_filter(&self) -> &Self::SyscallFilter {
-        &()
-    }
-    fn process_fault(&self) -> &Self::ProcessFault {
-        &()
-    }
-    fn credentials_checking_policy(&self) -> &'static Self::CredentialsCheckingPolicy {
-        &()
-    }
-    fn scheduler(&self) -> &Self::Scheduler {
-        self.scheduler
-    }
-    fn scheduler_timer(&self) -> &Self::SchedulerTimer {
-        &()
-    }
-    fn watchdog(&self) -> &Self::WatchDog {
-        &()
-    }
-    fn context_switch_callback(&self) -> &Self::ContextSwitchCallback {
-        &()
-    }
+    fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup { self }
+    fn syscall_filter(&self) -> &Self::SyscallFilter { &() }
+    fn process_fault(&self) -> &Self::ProcessFault { &() }
+    fn scheduler(&self) -> &Self::Scheduler { self.scheduler }
+    fn scheduler_timer(&self) -> &Self::SchedulerTimer { &() }
+    fn watchdog(&self) -> &Self::WatchDog { &() }
+    fn context_switch_callback(&self) -> &Self::ContextSwitchCallback { &() }
 }
 
 impl SyscallDriverLookup for Platform {
@@ -113,35 +95,88 @@ impl SyscallDriverLookup for Platform {
     }
 }
 
-/// Entry point in the vector table called on hard reset.
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
 #[no_mangle]
 pub unsafe fn main() {
-    // Loads relocations and clears BSS
-    nrf52833::init();
-    // Initialize chip peripheral drivers
-    let nrf52833_peripherals = static_init!(
-        Nrf52833DefaultPeripherals,
-        Nrf52833DefaultPeripherals::new()
+    // Disable the watchdog immediately. WDT_MR is write-once; the default
+    // ~16-second timeout can fire during crystal startup and reset the chip.
+    // WDT_MR = 0x400E1854, WDDIS = bit 15.
+    core::ptr::write_volatile(0x400E_1854 as *mut u32, 0x0000_8000);
+
+    // Enable all peripheral clocks needed by the bootloader before
+    // setup_clocks() enables PMC write-protection.  At reset WPEN=0 so
+    // PCER0 is writable without a key sequence.
+    //   PID 10 = PIOA  (PA21 USART1 RXD)
+    //   PID 11 = PIOB  (PB4  USART1 TXD)
+    //   PID 12 = PIOC  (PC9  LED1)
+    //   PID 14 = USART1 (EDBG CDC)
+    core::ptr::write_volatile(
+        0x400E_0610 as *mut u32,
+        (1u32 << 10) | (1u32 << 11) | (1u32 << 12) | (1u32 << 14),
     );
+    // Drive PC9 (LED1, active-low) immediately so LED is on during all of init.
+    core::ptr::write_volatile(0x400E_1200 as *mut u32, 1u32 << 9);  // PIOC_PER: PC9 → PIO
+    core::ptr::write_volatile(0x400E_1210 as *mut u32, 1u32 << 9);  // PIOC_OER: PC9 output
+    core::ptr::write_volatile(0x400E_1234 as *mut u32, 1u32 << 9);  // PIOC_CODR: PC9 LOW → LED on
 
-    // set up circular peripheral dependencies
-    nrf52833_peripherals.init();
-    let base_peripherals = &nrf52833_peripherals.nrf52;
+    // Configure flash wait states BEFORE raising MCK to 150 MHz.
+    // At 150 MHz, FWS=6 (7 cycles) is required. CLOE enables cache.
+    // EFC_FMR at 0x400E0C00: FWS=6 (bits 11:8) | CLOE (bit 26).
+    core::ptr::write_volatile(0x400E_0C00 as *mut u32, 0x0400_0600);
 
+    // Loads relocations and zeros BSS.
+    samv71q21b::init();
+
+    // -----------------------------------------------------------------------
+    // Clocks: 12 MHz crystal → PLLA ×25 = 300 MHz PCK, 150 MHz MCK
+    // -----------------------------------------------------------------------
+    pmc::PMC.setup_clocks();
+
+    // -----------------------------------------------------------------------
+    // Peripherals and flash wait states
+    // -----------------------------------------------------------------------
+    let peripherals = static_init!(
+        Atsamv71q21bDefaultPeripherals,
+        Atsamv71q21bDefaultPeripherals::new()
+    );
+    // Must configure wait states before running at full MCK speed.
+    peripherals.efc.init();
+
+    // Enable peripheral clocks needed by the bootloader.
+    pmc::PMC.enable_peripheral_clock(samv71q21b::uart::USART1_PID);
+    pmc::PMC.enable_peripheral_clock(10); // PIOA — PA21 USART1 RXD
+    pmc::PMC.enable_peripheral_clock(11); // PIOB — PB4  USART1 TXD
+    pmc::PMC.enable_peripheral_clock(12); // PIOC — PC9  LED1
+
+    // -----------------------------------------------------------------------
+    // Pin mux: USART1 EDBG CDC (PA21=RXD Periph A, PB4=TXD Periph D)
+    // PB4 is JTAG TDI after reset; release it via CCFG_SYSIO bit 4.
+    // -----------------------------------------------------------------------
+    unsafe {
+        let ccfg_sysio = 0x4008_8114 as *mut u32;
+        core::ptr::write_volatile(ccfg_sysio,
+            core::ptr::read_volatile(ccfg_sysio) | (1u32 << 4));
+    }
+    peripherals.pa.pin(21).select_peripheral(PeripheralFunction::A);
+    peripherals.pb.pin(4).select_peripheral(PeripheralFunction::D);
+
+    // -----------------------------------------------------------------------
+    // Kernel object
+    // -----------------------------------------------------------------------
     let board_kernel = static_init!(kernel::Kernel, kernel::Kernel::new(&PROCESSES));
 
-    //--------------------------------------------------------------------------
-    // BOOTLOADER ENTRY
-    //--------------------------------------------------------------------------
-
-    // Decide very early if we want to stay in the bootloader so we don't run a
-    // bunch of init code just to reset into the kernel.
-
-    let bootloader_entry_mode = static_init!(
-        bootloader::bootloader_entry_gpio::BootloaderEntryGpio<nrf52833::gpio::GPIOPin>,
-        bootloader::bootloader_entry_gpio::BootloaderEntryGpio::new(
-            &nrf52833_peripherals.gpio_port[BUTTON_A]
-        )
+    // -----------------------------------------------------------------------
+    // Bootloader entry check (runs early to minimize wasted init time)
+    // -----------------------------------------------------------------------
+    // Always stay in bootloader mode. No kernel exists at 0x00008000 yet;
+    // BootloaderEntryGpRegRet would jump there on every cold boot (GPBR7
+    // is 0 at power-up), landing in empty flash → HardFault → loop{}.
+    let bootloader_entry = static_init!(
+        BootloaderEntryAlways,
+        BootloaderEntryAlways::new()
     );
 
     let bootloader_jumper = static_init!(
@@ -149,154 +184,88 @@ pub unsafe fn main() {
         bootloader_cortexm::jumper::CortexMJumper::new()
     );
 
-    let active_notifier_led = static_init!(
-        kernel::hil::led::LedHigh<'static, nrf52833::gpio::GPIOPin>,
-        kernel::hil::led::LedHigh::new(&nrf52833_peripherals.gpio_port[LED_ON_PIN])
+    // Use PC9 (LED1 on SAMV71 Xplained Ultra) as the active indicator.
+    // PC8 (LED0) appears to be faulty on this board.
+    let led_pin = peripherals.pc.pin(9);
+    let active_led = static_init!(
+        kernel::hil::led::LedLow<'static, samv71q21b::gpio::GPIOPin<'static>>,
+        kernel::hil::led::LedLow::new(led_pin)
     );
 
-    let bootloader_active_notifier = static_init!(
+    let bootloader_notifier = static_init!(
         bootloader::active_notifier_ledon::ActiveNotifierLedon,
-        bootloader::active_notifier_ledon::ActiveNotifierLedon::new(active_notifier_led)
+        bootloader::active_notifier_ledon::ActiveNotifierLedon::new(active_led)
     );
 
     let bootloader_enterer = static_init!(
         bootloader::bootloader::BootloaderEnterer<'static>,
         bootloader::bootloader::BootloaderEnterer::new(
-            bootloader_entry_mode,
+            bootloader_entry,
             bootloader_jumper,
-            bootloader_active_notifier
+            bootloader_notifier
         )
     );
 
-    // First decide if we want to actually run the bootloader or not.
+    // Decides: jump to kernel, or stay in bootloader.
     bootloader_enterer.check();
 
-    //--------------------------------------------------------------------------
-    // CAPABILITIES
-    //--------------------------------------------------------------------------
-
-    // Create capabilities that the board needs to call certain protected kernel
-    // functions.
+    // -----------------------------------------------------------------------
+    // Capabilities
+    // -----------------------------------------------------------------------
     let main_loop_capability = create_capability!(capabilities::MainLoopCapability);
 
-    //--------------------------------------------------------------------------
-    // ALARM & TIMER
-    //--------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // UART: USART1 wired directly to the bootloader (uses hardware RTOR)
+    // -----------------------------------------------------------------------
+    let usart1 = &peripherals.usart1;
 
-    let rtc = &base_peripherals.rtc;
-    let _ = rtc.start();
+    // -----------------------------------------------------------------------
+    // Flash adapter
+    // -----------------------------------------------------------------------
+    let efc = &peripherals.efc;
 
-    let mux_alarm = components::alarm::AlarmMuxComponent::new(rtc)
-        .finalize(components::alarm_mux_component_static!(nrf52::rtc::Rtc));
-
-    // //--------------------------------------------------------------------------
-    // // UART DEBUGGING
-    // //--------------------------------------------------------------------------
-
-    // let channel = nrf52_components::UartChannelComponent::new(
-    //     UartChannel::Pins(UartPins::new(UART_RTS, UART_TXD, UART_CTS, UART_RXD)),
-    //     mux_alarm,
-    //     &base_peripherals.uarte0,
-    // )
-    // .finalize(());
-
-    // // Create a shared UART channel for the console and for kernel debug.
-    // let uart_mux =
-    //     components::console::UartMuxComponent::new(channel, 115200, dynamic_deferred_caller)
-    //         .finalize(());
-
-    // // Create the debugger object that handles calls to `debug!()`.
-    // components::debug_writer::DebugWriterComponent::new(uart_mux).finalize(());
-
-    //--------------------------------------------------------------------------
-    // BOOTLOADER
-    //--------------------------------------------------------------------------
-
-    // Setup receive with timeout.
-    let recv_auto_virtual_alarm = static_init!(
-        VirtualMuxAlarm<'static, nrf52833::rtc::Rtc>,
-        VirtualMuxAlarm::new(mux_alarm)
+    let efc_page_buf = static_init!(
+        samv71q21b::efc::Sam71Page,
+        samv71q21b::efc::Sam71Page::default()
     );
-    recv_auto_virtual_alarm.setup();
-
-    let recv_auto_uart = static_init!(
-        bootloader::uart_receive_multiple_timeout::UartReceiveMultipleTimeout<
-            'static,
-            VirtualMuxAlarm<'static, nrf52833::rtc::Rtc>,
-        >,
-        bootloader::uart_receive_multiple_timeout::UartReceiveMultipleTimeout::new(
-            &base_peripherals.uarte0,
-            recv_auto_virtual_alarm,
-            &mut bootloader::uart_receive_multiple_timeout::BUF
-        )
-    );
-    recv_auto_virtual_alarm.set_alarm_client(recv_auto_uart);
-
-    // Setup the UART pins
-    let _ = base_peripherals.uarte0.initialize(
-        nrf52833::pinmux::Pinmux::new(UART_TXD as u32),
-        nrf52833::pinmux::Pinmux::new(UART_RXD as u32),
-        None,
-        None,
-    );
-
-    let nrfpagebuffer = static_init!(nrf52::nvmc::NrfPage, nrf52::nvmc::NrfPage::default());
 
     let flash_adapter = static_init!(
-        bootloader::flash_large_to_small::FlashLargeToSmall<'static, nrf52833::nvmc::Nvmc>,
-        bootloader::flash_large_to_small::FlashLargeToSmall::new(
-            &base_peripherals.nvmc,
-            nrfpagebuffer,
-        )
+        flash_passthrough::Sam71FlashDirect,
+        flash_passthrough::Sam71FlashDirect::new(efc, efc_page_buf)
     );
-    hil::flash::HasClient::set_client(&base_peripherals.nvmc, flash_adapter);
+    hil::flash::HasClient::set_client(efc, flash_adapter);
 
-    let pagebuffer = static_init!(
+    let bl_page_buf = static_init!(
         bootloader::flash_large_to_small::FiveTwelvePage,
         bootloader::flash_large_to_small::FiveTwelvePage::default()
     );
 
+    // -----------------------------------------------------------------------
+    // Bootloader core
+    // -----------------------------------------------------------------------
     let bootloader = static_init!(
         bootloader::bootloader::Bootloader<
             'static,
-            bootloader::uart_receive_multiple_timeout::UartReceiveMultipleTimeout<
-                'static,
-                VirtualMuxAlarm<'static, nrf52833::rtc::Rtc>,
-            >,
-            bootloader::flash_large_to_small::FlashLargeToSmall<'static, nrf52::nvmc::Nvmc>,
+            Usart1<'static>,
+            flash_passthrough::Sam71FlashDirect,
         >,
         bootloader::bootloader::Bootloader::new(
-            recv_auto_uart,
+            usart1,
             flash_adapter,
             &bootloader_exit,
-            pagebuffer,
+            bl_page_buf,
             &mut bootloader::bootloader::BUF
         )
     );
 
-    hil::uart::Transmit::set_transmit_client(&base_peripherals.uarte0, bootloader);
-    hil::uart::Receive::set_receive_client(&base_peripherals.uarte0, recv_auto_uart);
-    hil::uart::Receive::set_receive_client(recv_auto_uart, bootloader);
+    hil::uart::Transmit::set_transmit_client(usart1, bootloader);
+    hil::uart::Receive::set_receive_client(usart1, bootloader);
     hil::flash::HasClient::set_client(flash_adapter, bootloader);
 
-    //--------------------------------------------------------------------------
-    // SCHEDULER
-    //--------------------------------------------------------------------------
-
+    // -----------------------------------------------------------------------
+    // Chip and platform
+    // -----------------------------------------------------------------------
     let null_scheduler = static_init!(NullScheduler, NullScheduler::new());
-
-    //--------------------------------------------------------------------------
-    // FINAL SETUP AND BOARD BOOT
-    //--------------------------------------------------------------------------
-
-    // Start all of the clocks. Low power operation will require a better
-    // approach than this.
-    base_peripherals.clock.low_stop();
-    base_peripherals.clock.high_stop();
-    base_peripherals.clock.low_start();
-    base_peripherals.clock.high_start();
-    while !base_peripherals.clock.low_started() {}
-    while !base_peripherals.clock.high_started() {}
 
     let platform = Platform {
         bootloader,
@@ -304,29 +273,43 @@ pub unsafe fn main() {
     };
 
     let chip = static_init!(
-        nrf52833::chip::NRF52<Nrf52833DefaultPeripherals>,
-        nrf52833::chip::NRF52::new(nrf52833_peripherals)
+        Atsamv71q21b<Atsamv71q21bDefaultPeripherals>,
+        Atsamv71q21b::new(peripherals)
     );
     CHIP = Some(chip);
 
-    // Actually run the bootloader.
+    // Enable NVIC IRQs for the two peripherals the bootloader uses.
+    // WFI wakes only for ISER-enabled interrupts (SEVONPEND=0 on Cortex-M7).
+    // Using enable_all() is unsafe here: service_pending_interrupts() calls
+    // assert!(handled, ...) for every interrupt, so any unhandled peripheral
+    // (SUPC=0, RSTC=1, RTT=3 ...) firing spuriously causes a panic → loop{}.
+    cortexm7::nvic::Nvic::new(14).enable(); // USART1 — EDBG CDC bootloader UART
+    cortexm7::nvic::Nvic::new(6).enable();  // EFC   — flash write/erase
+
+    // Start the UART and begin listening for bootloader commands.
     platform.bootloader.start();
 
-    //--------------------------------------------------------------------------
-    // MAIN LOOP
-    //--------------------------------------------------------------------------
-
-    board_kernel.kernel_loop(
-        &platform,
-        chip,
-        None::<&kernel::ipc::IPC<0>>,
-        &main_loop_capability,
-    );
+    // Use minimal NVIC loop — the Tock kernel_loop has unresolved issues
+    // on SAMV71 (interrupts not serviced correctly with NullScheduler).
+    loop {
+        unsafe {
+            while let Some(interrupt) = cortexm7::nvic::next_pending() {
+                match interrupt {
+                    14 => peripherals.usart1.handle_interrupt(),
+                    6 => peripherals.efc.handle_interrupt(),
+                    _ => {}
+                }
+                let n = cortexm7::nvic::Nvic::new(interrupt);
+                n.clear_pending();
+                n.enable();
+            }
+            cortexm7::support::wfi();
+        }
+    }
 }
 
 #[cfg(not(test))]
-#[no_mangle]
 #[panic_handler]
-pub unsafe extern "C" fn panic_fmt(_pi: &PanicInfo) -> ! {
+pub unsafe fn panic_fmt(_pi: &PanicInfo) -> ! {
     loop {}
 }

@@ -6,24 +6,12 @@ build = "build.rs"
 edition = "2021"
 
 [dependencies]
-cortexm7 = { git = "https://github.com/tock/tock", rev = "2ff6868" }
-capsules-core = { git = "https://github.com/tock/tock", rev = "2ff6868" }
-kernel = { git = "https://github.com/tock/tock", rev = "2ff6868" }
-samv71q21b = { git = "https://github.com/BobAdamsEE/tock/", rev = "33a6fda" }
-components = { git = "https://github.com/tock/tock", rev = "2ff6868" }
-
-# For Development
-# cortexm4 = { path = "../../../tock/arch/cortex-m4" }
-# capsules = { path = "../../../tock/capsules" }
-# kernel = { path = "../../../tock/kernel" }
-# nrf52 = { path = "../../../tock/chips/nrf52" }
-# nrf52833 = { path = "../../../tock/chips/nrf52833" }
-# components = { path = "../../../tock/boards/components" }
-
-bootloader = { path = "../../bootloader" }
-bootloader_samv71 = { path = "../../chips/bootloader_samv71" }
+cortexm7        = { path = "../../../tock/arch/cortex-m7" }
+kernel          = { path = "../../../tock/kernel" }
+samv71q21b      = { path = "../../../tock/chips/samv71q21b" }
+bootloader      = { path = "../../bootloader" }
+bootloader_samv71  = { path = "../../chips/bootloader_samv71" }
 bootloader_cortexm = { path = "../../arch/bootloader_cortexm" }
-
 
 [build-dependencies]
 bootloader_attributes = { path = "../../tools/bootloader_attributes" }
