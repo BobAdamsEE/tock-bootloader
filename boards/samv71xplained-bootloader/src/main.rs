@@ -24,13 +24,15 @@ use kernel::{create_capability, static_init};
 
 use bootloader::null_scheduler::NullScheduler;
 
-use bootloader::bootloader_entry_always::BootloaderEntryAlways;
+use bootloader_samv71::bootloader_entry_gpbr::BootloaderEntryGpRegRet;
 
 use samv71q21b::chip::{Atsamv71q21b, Atsamv71q21bDefaultPeripherals};
 use samv71q21b::efc::Efc;
 use samv71q21b::gpio::PeripheralFunction;
+use samv71q21b::gpbr::Gpbr;
 use samv71q21b::pmc;
 use samv71q21b::uart::Usart1;
+use samv71q21b::xdmac;
 
 // ---------------------------------------------------------------------------
 // Platform constants
@@ -45,7 +47,54 @@ static mut CHIP: Option<&'static Atsamv71q21b<Atsamv71q21bDefaultPeripherals>> =
 /// Reserve stack space (8 KB).
 #[no_mangle]
 #[link_section = ".stack_buffer"]
-pub static mut STACK_MEMORY: [u8; 0x2000] = [0; 0x2000];
+pub static mut STACK_MEMORY: [u8; 0x4000] = [0; 0x4000];
+
+/// Bootloader flags at _flags_address (0x400).
+/// - Offset 14: version string (up to 8 bytes, null-terminated)
+/// - Offset 32: kernel start address (4 bytes, little-endian)
+#[used]
+#[link_section = ".flags"]
+static BOOTLOADER_FLAGS: [u8; 36] = {
+    let mut f = [0u8; 36];
+    // Version "0.1.0"
+    f[14] = b'0'; f[15] = b'.'; f[16] = b'1'; f[17] = b'.'; f[18] = b'0';
+    // Kernel start address: 0x00008000 (alias region, after 32 KB bootloader)
+    f[32] = 0x00; f[33] = 0x80; f[34] = 0x00; f[35] = 0x00; // little-endian
+    f
+};
+
+/// Board attributes baked into flash at _attributes_address (0x600).
+/// Each attribute: 8-byte key (null-padded) | 1-byte value length | 55-byte value.
+#[used]
+#[link_section = ".attributes"]
+static BOARD_ATTRIBUTES: [u8; 256] = {
+    let mut d = [0u8; 256];
+    // Attribute 0: board = "samv71xplained"
+    d[0] = b'b'; d[1] = b'o'; d[2] = b'a'; d[3] = b'r'; d[4] = b'd';
+    d[8] = 14;
+    d[9] = b's'; d[10] = b'a'; d[11] = b'm'; d[12] = b'v'; d[13] = b'7';
+    d[14] = b'1'; d[15] = b'x'; d[16] = b'p'; d[17] = b'l'; d[18] = b'a';
+    d[19] = b'i'; d[20] = b'n'; d[21] = b'e'; d[22] = b'd';
+    // Attribute 1: arch = "cortex-m7"
+    d[64] = b'a'; d[65] = b'r'; d[66] = b'c'; d[67] = b'h';
+    d[72] = 9;
+    d[73] = b'c'; d[74] = b'o'; d[75] = b'r'; d[76] = b't'; d[77] = b'e';
+    d[78] = b'x'; d[79] = b'-'; d[80] = b'm'; d[81] = b'7';
+    // Attribute 2: jldevice = "ATSAMV71Q21B"
+    d[128] = b'j'; d[129] = b'l'; d[130] = b'd'; d[131] = b'e';
+    d[132] = b'v'; d[133] = b'i'; d[134] = b'c'; d[135] = b'e';
+    d[136] = 12;
+    d[137] = b'A'; d[138] = b'T'; d[139] = b'S'; d[140] = b'A';
+    d[141] = b'M'; d[142] = b'V'; d[143] = b'7'; d[144] = b'1';
+    d[145] = b'Q'; d[146] = b'2'; d[147] = b'1'; d[148] = b'B';
+    // Attribute 3: appaddr = "0x40000"
+    d[192] = b'a'; d[193] = b'p'; d[194] = b'p'; d[195] = b'a';
+    d[196] = b'd'; d[197] = b'd'; d[198] = b'r';
+    d[200] = 7;
+    d[201] = b'0'; d[202] = b'x'; d[203] = b'4'; d[204] = b'0';
+    d[205] = b'0'; d[206] = b'0'; d[207] = b'0';
+    d
+};
 
 // ---------------------------------------------------------------------------
 // Bootloader exit: reset the chip so it re-enters the entry check and then
@@ -106,6 +155,17 @@ pub unsafe fn main() {
     // WDT_MR = 0x400E1854, WDDIS = bit 15.
     core::ptr::write_volatile(0x400E_1854 as *mut u32, 0x0000_8000);
 
+    // Change the flash slave's default master BEFORE any flash reads.
+    // The I-Code bus as fixed default master (reset default) causes
+    // I-Code prefetch activity to block EEFC page buffer fills from
+    // D-Code/System/XDMAC writes. Setting DEFMSTR_TYPE=1 (Last Access
+    // Master) allows the flash slave to accept writes from whichever
+    // master accessed it last.
+    // MATRIX_SCFG[2] at 0x40088048: SLOT_CYCLE=511, DEFMSTR_TYPE=1
+    core::ptr::write_volatile(0x4008_8048 as *mut u32, 0x0001_01FF);
+    // Also SCFG[3] in case flash maps to both slaves
+    core::ptr::write_volatile(0x4008_804C as *mut u32, 0x0001_01FF);
+
     // Enable all peripheral clocks needed by the bootloader before
     // setup_clocks() enables PMC write-protection.  At reset WPEN=0 so
     // PCER0 is writable without a key sequence.
@@ -147,6 +207,7 @@ pub unsafe fn main() {
 
     // Enable peripheral clocks needed by the bootloader.
     pmc::PMC.enable_peripheral_clock(samv71q21b::uart::USART1_PID);
+    pmc::PMC.enable_peripheral_clock(xdmac::XDMAC_PID); // XDMAC for UART DMA receive
     pmc::PMC.enable_peripheral_clock(10); // PIOA — PA21 USART1 RXD
     pmc::PMC.enable_peripheral_clock(11); // PIOB — PB4  USART1 TXD
     pmc::PMC.enable_peripheral_clock(12); // PIOC — PC9  LED1
@@ -171,12 +232,10 @@ pub unsafe fn main() {
     // -----------------------------------------------------------------------
     // Bootloader entry check (runs early to minimize wasted init time)
     // -----------------------------------------------------------------------
-    // Always stay in bootloader mode. No kernel exists at 0x00008000 yet;
-    // BootloaderEntryGpRegRet would jump there on every cold boot (GPBR7
-    // is 0 at power-up), landing in empty flash → HardFault → loop{}.
+    let gpbr = static_init!(Gpbr, Gpbr::new());
     let bootloader_entry = static_init!(
-        BootloaderEntryAlways,
-        BootloaderEntryAlways::new()
+        BootloaderEntryGpRegRet,
+        BootloaderEntryGpRegRet::new(gpbr)
     );
 
     let bootloader_jumper = static_init!(
@@ -216,7 +275,10 @@ pub unsafe fn main() {
 
     // -----------------------------------------------------------------------
     // UART: USART1 wired directly to the bootloader (uses hardware RTOR)
+    // XDMAC provides DMA receive so full WritePage commands (516+ bytes)
+    // arrive in a single buffer instead of being split across callbacks.
     // -----------------------------------------------------------------------
+    peripherals.usart1.set_xdmac(&peripherals.xdmac);
     let usart1 = &peripherals.usart1;
 
     // -----------------------------------------------------------------------
@@ -284,28 +346,25 @@ pub unsafe fn main() {
     // assert!(handled, ...) for every interrupt, so any unhandled peripheral
     // (SUPC=0, RSTC=1, RTT=3 ...) firing spuriously causes a panic → loop{}.
     cortexm7::nvic::Nvic::new(14).enable(); // USART1 — EDBG CDC bootloader UART
-    cortexm7::nvic::Nvic::new(6).enable();  // EFC   — flash write/erase
+    cortexm7::nvic::Nvic::new(58).enable(); // XDMAC  — DMA transfer complete
+    // EFC interrupt not needed — flash commands use synchronous IAP from ROM.
 
     // Start the UART and begin listening for bootloader commands.
     platform.bootloader.start();
 
-    // Use minimal NVIC loop — the Tock kernel_loop has unresolved issues
-    // on SAMV71 (interrupts not serviced correctly with NullScheduler).
-    loop {
-        unsafe {
-            while let Some(interrupt) = cortexm7::nvic::next_pending() {
-                match interrupt {
-                    14 => peripherals.usart1.handle_interrupt(),
-                    6 => peripherals.efc.handle_interrupt(),
-                    _ => {}
-                }
-                let n = cortexm7::nvic::Nvic::new(interrupt);
-                n.clear_pending();
-                n.enable();
-            }
-            cortexm7::support::wfi();
-        }
+    // Initialize deferred call state (required by kernel_loop's verify_setup).
+    unsafe {
+        kernel::deferred_call::initialize_deferred_call_state_unsafe::<
+            cortexm7::thread_id::CortexMThreadIdProvider,
+        >();
     }
+
+    board_kernel.kernel_loop(
+        &platform,
+        chip,
+        None::<&kernel::ipc::IPC<0>>,
+        &main_loop_capability,
+    );
 }
 
 #[cfg(not(test))]

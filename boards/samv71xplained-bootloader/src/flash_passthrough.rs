@@ -63,19 +63,18 @@ impl flash::Flash for Sam71FlashDirect {
         page_number: usize,
         buf: &'static mut FiveTwelvePage,
     ) -> Result<(), (ErrorCode, &'static mut FiveTwelvePage)> {
+        let efc_buf = match self.efc_page.take() {
+            Some(b) => b,
+            None => return Err((ErrorCode::BUSY, buf)),
+        };
+        for i in 0..512 {
+            efc_buf.0[i] = buf.0[i];
+        }
         self.client_page.replace(buf);
-        self.efc_page.take().map_or_else(
-            || Err((ErrorCode::BUSY, self.client_page.take().unwrap())),
-            |efc_buf| {
-                efc_buf.0.copy_from_slice(&self.client_page.map_or([0u8; 512], |p| p.0));
-                self.efc
-                    .write_page(page_number, efc_buf)
-                    .map_err(|e| {
-                        self.efc_page.replace(e.1);
-                        (ErrorCode::FAIL, self.client_page.take().unwrap())
-                    })
-            },
-        )
+        self.efc.write_page(page_number, efc_buf).map_err(|e| {
+            self.efc_page.replace(e.1);
+            (ErrorCode::FAIL, self.client_page.take().unwrap())
+        })
     }
 
     fn erase_page(&self, page_number: usize) -> Result<(), ErrorCode> {
