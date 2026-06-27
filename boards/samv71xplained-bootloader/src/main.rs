@@ -183,9 +183,10 @@ pub unsafe fn main() {
     core::ptr::write_volatile(0x400E_1234 as *mut u32, 1u32 << 9);  // PIOC_CODR: PC9 LOW → LED on
 
     // Configure flash wait states BEFORE raising MCK to 150 MHz.
-    // At 150 MHz, FWS=6 (7 cycles) is required. CLOE enables cache.
-    // EFC_FMR at 0x400E0C00: FWS=6 (bits 11:8) | CLOE (bit 26).
-    core::ptr::write_volatile(0x400E_0C00 as *mut u32, 0x0400_0600);
+    // At 150 MHz, FWS=6 (7 cycles) is required.
+    // CLOE (bit 26) intentionally OFF — stale EEFC read buffer causes
+    // CRC mismatches during tockloader installs.
+    core::ptr::write_volatile(0x400E_0C00 as *mut u32, 0x0000_0600);
 
     // Loads relocations and zeros BSS.
     samv71q21b::init();
@@ -195,12 +196,21 @@ pub unsafe fn main() {
     // -----------------------------------------------------------------------
     pmc::PMC.setup_clocks();
 
+    // Deferred call state must be initialized before any DeferredCall::new()
+    // (DefaultPeripherals includes MCAN which creates one).
+    unsafe {
+        kernel::deferred_call::initialize_deferred_call_state_unsafe::<
+            cortexm7::thread_id::CortexMThreadIdProvider,
+        >();
+    }
+
     // -----------------------------------------------------------------------
     // Peripherals and flash wait states
     // -----------------------------------------------------------------------
+    let mcan_msg_ram = static_init!(samv71q21b::mcan::MessageRam, samv71q21b::mcan::MessageRam::new());
     let peripherals = static_init!(
         Atsamv71q21bDefaultPeripherals,
-        Atsamv71q21bDefaultPeripherals::new()
+        Atsamv71q21bDefaultPeripherals::new(mcan_msg_ram)
     );
     // Must configure wait states before running at full MCK speed.
     peripherals.efc.init();
@@ -352,12 +362,9 @@ pub unsafe fn main() {
     // Start the UART and begin listening for bootloader commands.
     platform.bootloader.start();
 
-    // Initialize deferred call state (required by kernel_loop's verify_setup).
-    unsafe {
-        kernel::deferred_call::initialize_deferred_call_state_unsafe::<
-            cortexm7::thread_id::CortexMThreadIdProvider,
-        >();
-    }
+    // Register MCAN deferred call (created by DefaultPeripherals but unused
+    // in the bootloader). verify_setup requires created == registered.
+    kernel::deferred_call::DeferredCallClient::register(&peripherals.mcan1);
 
     board_kernel.kernel_loop(
         &platform,
