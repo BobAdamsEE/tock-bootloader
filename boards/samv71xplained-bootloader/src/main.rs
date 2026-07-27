@@ -483,7 +483,13 @@ pub unsafe fn main() {
             flash_for_tockloader,
             &bootloader_exit,
             bl_page_buf,
-            &mut bootloader::bootloader::BUF
+            &mut bootloader::bootloader::BUF,
+            // Refuse writes and erases below the kernel: the whole 32 KB rom
+            // region is the bootloader's, including the vector table, the
+            // flags at 0x400 and the attribute table at 0x600. Matches the
+            // UDS server's floor in spirit, though that one starts higher
+            // still (see the design document, sections 13.4 and 13.5).
+            0x0000_8000,
         )
     );
 

@@ -26,8 +26,6 @@ pub static mut BUF: [u8; 600] = [0; 600];
 extern "C" {
     static _flags_address: u8;
     static _attributes_address: u8;
-    static _stext: u8;
-    static _etext: u8;
 }
 
 // Bootloader constants
@@ -149,10 +147,24 @@ pub struct Bootloader<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash 
     state: Cell<State>,
     flags_address: usize,
     attributes_address: usize,
-    /// Address of the bootloader in flash.
-    bootloader_address: u32,
-    /// Address after the bootloader in flash.
-    bootloader_end_address: u32,
+    /// First address the bootloader will let a client write or erase.
+    ///
+    /// Everything below it is the bootloader's own flash region: the vector
+    /// table, the flags at `_flags_address`, the attribute table at
+    /// `_attributes_address`, and the code itself. The board supplies the
+    /// whole region rather than just `_stext.._etext`, and that matters more
+    /// than it looks:
+    ///
+    /// * The flags and attributes sit *below* `_stext`, so a bound starting
+    ///   there leaves them writable, and a write to the attribute table
+    ///   block-erases the bootloader out from under itself (see the SAMV71
+    ///   EFC's `write_page`, which erases a 16-page block when the target page
+    ///   is dirty).
+    /// * Erase granularity is coarser than a page. Erasing a page just above
+    ///   the bootloader's last byte can still take out the block containing
+    ///   its last byte, so the bound has to sit on a region boundary, not on
+    ///   `_etext`.
+    protected_end: u32,
 }
 
 impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> Bootloader<'a, T, F> {
@@ -162,6 +174,7 @@ impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> Bootloader<
         reset_function: &'a (dyn Fn() + 'a),
         page_buffer: &'static mut F::Page,
         buffer: &'static mut [u8],
+        protected_end: u32,
     ) -> Bootloader<'a, T, F> {
         Bootloader {
             transport: transport,
@@ -172,8 +185,7 @@ impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> Bootloader<
             state: Cell::new(State::Idle),
             flags_address: unsafe { (&_flags_address as *const u8) as usize },
             attributes_address: unsafe { (&_attributes_address as *const u8) as usize },
-            bootloader_address: unsafe { (&_stext as *const u8) as u32 },
-            bootloader_end_address: unsafe { (&_etext as *const u8) as u32 },
+            protected_end,
         }
     }
 
@@ -304,9 +316,7 @@ impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> BootloaderT
                             self.page_buffer.replace(page);
                             self.state.set(State::Idle);
                             let _ = self.transport.transmit_message(buffer, 2);
-                        } else if address >= self.bootloader_address
-                            && address < self.bootloader_end_address
-                        {
+                        } else if address < self.protected_end {
                             buffer[0] = ESCAPE_CHAR;
                             buffer[1] = RES_BADADDR;
                             self.page_buffer.replace(page);
@@ -325,10 +335,22 @@ impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> BootloaderT
                 }
                 Ok(Some(tock_bootloader_protocol::Command::ErasePage { address })) => {
                     let buffer = buf.take().unwrap();
-                    self.state.set(State::ErasePage);
-                    self.buffer.replace(buffer);
-                    let page_size = self.page_buffer.map_or(512, |page| page.as_mut().len());
-                    let _ = self.flash.erase_page(address as usize / page_size);
+                    // Erase had no address check at all, while WritePage did.
+                    // Erasing the bootloader is at least as destructive as
+                    // writing it -- more so on a flash whose erase granularity
+                    // is a multiple of the page size, because a single erase
+                    // takes out neighbours the caller never named.
+                    if address < self.protected_end {
+                        buffer[0] = ESCAPE_CHAR;
+                        buffer[1] = RES_BADADDR;
+                        self.state.set(State::Idle);
+                        let _ = self.transport.transmit_message(buffer, 2);
+                    } else {
+                        self.state.set(State::ErasePage);
+                        self.buffer.replace(buffer);
+                        let page_size = self.page_buffer.map_or(512, |page| page.as_mut().len());
+                        let _ = self.flash.erase_page(address as usize / page_size);
+                    }
                     break;
                 }
                 Ok(Some(tock_bootloader_protocol::Command::CrcIntFlash { address, length })) => {

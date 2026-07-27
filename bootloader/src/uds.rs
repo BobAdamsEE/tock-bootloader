@@ -14,10 +14,19 @@
 //!   0x2E  WriteDataByIdentifier
 //!   0x31  RoutineControl             erase memory, check memory
 //!   0x34  RequestDownload
-//!   0x36  TransferData
+//!   0x35  RequestUpload
+//!   0x36  TransferData               carries data either way
 //!   0x37  RequestTransferExit
 //!   0x3E  TesterPresent
 //! ```
+//!
+//! # Transfers
+//!
+//! One at a time, in one direction, as ISO 14229 requires -- so download and
+//! upload share the address, remaining-length and block-sequence state. Upload
+//! exists because every `tockloader` channel needs `read_range`: without it
+//! there is no listing installed applications, no inspecting them, and no
+//! reading an image back to verify it.
 //!
 //! # Response pending
 //!
@@ -52,6 +61,7 @@ const SID_SECURITY_ACCESS: u8 = 0x27;
 const SID_WRITE_DATA_BY_IDENTIFIER: u8 = 0x2E;
 const SID_ROUTINE_CONTROL: u8 = 0x31;
 const SID_REQUEST_DOWNLOAD: u8 = 0x34;
+const SID_REQUEST_UPLOAD: u8 = 0x35;
 const SID_TRANSFER_DATA: u8 = 0x36;
 const SID_REQUEST_TRANSFER_EXIT: u8 = 0x37;
 const SID_TESTER_PRESENT: u8 = 0x3E;
@@ -91,8 +101,9 @@ const DID_APPLICATION_START_ADDRESS: u16 = 0xF200;
 /// Payload bytes per `TransferData`, chosen to be exactly one flash page so a
 /// block maps to a single write with no buffering in between.
 const TRANSFER_BLOCK: usize = 512;
-/// `maxNumberOfBlockLength` reported by `RequestDownload`: the block plus the
-/// service and sequence bytes that precede it.
+/// `maxNumberOfBlockLength` reported by `RequestDownload` and `RequestUpload`:
+/// the block plus the service and sequence bytes that precede it. It bounds
+/// the request when downloading and the response when uploading.
 const MAX_BLOCK_LENGTH: u16 = (TRANSFER_BLOCK + 2) as u16;
 
 /// XORed with the seed to form the expected key. Not a secret; see the module
@@ -106,6 +117,17 @@ enum Security {
     Unlocked,
 }
 
+/// Which direction a transfer is going, if one is open at all.
+///
+/// ISO 14229 allows one at a time, so download and upload share the address,
+/// remaining-length and block-sequence state rather than duplicating it.
+#[derive(Copy, Clone, PartialEq)]
+enum Transfer {
+    None,
+    Download,
+    Upload,
+}
+
 /// What the server is doing between receiving a request and answering it.
 #[derive(Copy, Clone, PartialEq)]
 enum Job {
@@ -114,6 +136,8 @@ enum Job {
     Erase { page: usize, end: usize },
     /// Writing one downloaded block.
     Write,
+    /// Reading the page that answers one upload block.
+    Read,
     /// 0x78 sent; CRC over `address` for `remaining` more bytes.
     Crc {
         address: u32,
@@ -137,11 +161,17 @@ pub struct UdsServer<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash +
     security: Cell<Security>,
     job: Cell<Job>,
 
-    /// Active `RequestDownload`.
-    download_active: Cell<bool>,
-    download_address: Cell<u32>,
-    download_remaining: Cell<u32>,
+    /// Active `RequestDownload` or `RequestUpload`.
+    transfer: Cell<Transfer>,
+    transfer_address: Cell<u32>,
+    transfer_remaining: Cell<u32>,
     next_block_sequence: Cell<u8>,
+    /// Where the block just handed out came from, so that a tester repeating
+    /// the previous sequence number gets the same bytes again rather than an
+    /// error. The download direction can re-acknowledge a repeat cheaply; the
+    /// upload direction has to re-read, which needs these.
+    prev_block_address: Cell<u32>,
+    prev_block_len: Cell<usize>,
 
     /// Guards against recursing once per page.
     ///
@@ -177,9 +207,11 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
             session: Cell::new(SESSION_DEFAULT),
             security: Cell::new(Security::Locked),
             job: Cell::new(Job::None),
-            download_active: Cell::new(false),
-            download_address: Cell::new(0),
-            download_remaining: Cell::new(0),
+            transfer: Cell::new(Transfer::None),
+            prev_block_address: Cell::new(0),
+            prev_block_len: Cell::new(0),
+            transfer_address: Cell::new(0),
+            transfer_remaining: Cell::new(0),
             next_block_sequence: Cell::new(1),
             stepping: Cell::new(false),
             step_again: Cell::new(false),
@@ -250,6 +282,7 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
             SID_WRITE_DATA_BY_IDENTIFIER => self.write_data_by_identifier(buffer, len),
             SID_ROUTINE_CONTROL => self.routine_control(buffer, len),
             SID_REQUEST_DOWNLOAD => self.request_download(buffer, len),
+            SID_REQUEST_UPLOAD => self.request_upload(buffer, len),
             SID_TRANSFER_DATA => self.transfer_data(buffer, len),
             SID_REQUEST_TRANSFER_EXIT => self.request_transfer_exit(buffer, len),
             SID_TESTER_PRESENT => self.tester_present(buffer, len),
@@ -267,9 +300,9 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
                 self.session.set(sub);
                 if sub == SESSION_DEFAULT {
                     // Leaving the programming session drops any unlock and any
-                    // download in progress.
+                    // transfer in progress.
                     self.security.set(Security::Locked);
-                    self.download_active.set(false);
+                    self.transfer.set(Transfer::None);
                 }
                 buffer[0] = SID_DIAGNOSTIC_SESSION_CONTROL + POSITIVE_RESPONSE_OFFSET;
                 buffer[1] = sub;
@@ -503,7 +536,7 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
         if !self.unlocked() {
             return self.send_negative(buffer, SID_REQUEST_DOWNLOAD, NRC_SECURITY_ACCESS_DENIED);
         }
-        if self.download_active.get() {
+        if self.transfer.get() != Transfer::None {
             return self.send_negative(
                 buffer,
                 SID_REQUEST_DOWNLOAD,
@@ -525,9 +558,9 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
             return self.send_negative(buffer, SID_REQUEST_DOWNLOAD, NRC_REQUEST_OUT_OF_RANGE);
         }
 
-        self.download_active.set(true);
-        self.download_address.set(address);
-        self.download_remaining.set(size);
+        self.transfer.set(Transfer::Download);
+        self.transfer_address.set(address);
+        self.transfer_remaining.set(size);
         self.next_block_sequence.set(1);
 
         buffer[0] = SID_REQUEST_DOWNLOAD + POSITIVE_RESPONSE_OFFSET;
@@ -537,11 +570,150 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
         self.send(buffer, 4);
     }
 
-    fn transfer_data(&self, buffer: &'static mut [u8], len: usize) {
+    /// `RequestUpload`: the tester wants to read flash back.
+    ///
+    /// The mirror of `request_download`, with two deliberate differences. The
+    /// address need not be page-aligned, because a reader has no reason to
+    /// care where pages fall and `read_range` does not: an unaligned start
+    /// simply makes the first block short. And `maxNumberOfBlockLength` is the
+    /// same 514, which for this direction bounds the *response*.
+    fn request_upload(&self, buffer: &'static mut [u8], len: usize) {
+        if len < 11 {
+            return self.send_negative(buffer, SID_REQUEST_UPLOAD, NRC_INCORRECT_LENGTH);
+        }
+        // Reading flash back is how firmware is extracted, so it sits behind
+        // the same unlock as writing it. CheckMemory already took that view.
+        if !self.unlocked() {
+            return self.send_negative(buffer, SID_REQUEST_UPLOAD, NRC_SECURITY_ACCESS_DENIED);
+        }
+        if self.transfer.get() != Transfer::None {
+            return self.send_negative(
+                buffer,
+                SID_REQUEST_UPLOAD,
+                NRC_UPLOAD_DOWNLOAD_NOT_ACCEPTED,
+            );
+        }
+        if buffer[1] != 0x00 {
+            return self.send_negative(buffer, SID_REQUEST_UPLOAD, NRC_REQUEST_OUT_OF_RANGE);
+        }
+        if buffer[2] != 0x44 {
+            return self.send_negative(buffer, SID_REQUEST_UPLOAD, NRC_REQUEST_OUT_OF_RANGE);
+        }
+        let address = u32::from_be_bytes([buffer[3], buffer[4], buffer[5], buffer[6]]);
+        let size = u32::from_be_bytes([buffer[7], buffer[8], buffer[9], buffer[10]]);
+
+        if !self.range_ok(address, size) {
+            return self.send_negative(buffer, SID_REQUEST_UPLOAD, NRC_REQUEST_OUT_OF_RANGE);
+        }
+
+        self.transfer.set(Transfer::Upload);
+        self.transfer_address.set(address);
+        self.transfer_remaining.set(size);
+        self.next_block_sequence.set(1);
+        self.prev_block_len.set(0);
+
+        buffer[0] = SID_REQUEST_UPLOAD + POSITIVE_RESPONSE_OFFSET;
+        buffer[1] = 0x20;
+        buffer[2] = (MAX_BLOCK_LENGTH >> 8) as u8;
+        buffer[3] = MAX_BLOCK_LENGTH as u8;
+        self.send(buffer, 4);
+    }
+
+    /// Read one block for an upload and answer with it.
+    ///
+    /// `address` and `take` are passed rather than read from the transfer
+    /// state, so that repeating the previous block re-reads exactly what was
+    /// sent before.
+    fn upload_block(&self, buffer: &'static mut [u8], address: u32, take: usize) {
+        let page_size = self.page_size();
+        self.buffer.replace(buffer);
+        self.job.set(Job::Read);
+        self.prev_block_address.set(address);
+        self.prev_block_len.set(take);
+
+        match self.page_buffer.take() {
+            Some(page) => {
+                if let Err((_e, page)) = self.flash.read_page(address as usize / page_size, page) {
+                    self.page_buffer.replace(page);
+                    self.job.set(Job::None);
+                    if let Some(buffer) = self.buffer.take() {
+                        self.send_negative(
+                            buffer,
+                            SID_TRANSFER_DATA,
+                            NRC_GENERAL_PROGRAMMING_FAILURE,
+                        );
+                    }
+                }
+            }
+            None => {
+                self.job.set(Job::None);
+                if let Some(buffer) = self.buffer.take() {
+                    self.send_negative(
+                        buffer,
+                        SID_TRANSFER_DATA,
+                        NRC_GENERAL_PROGRAMMING_FAILURE,
+                    );
+                }
+            }
+        }
+    }
+
+    fn transfer_data_upload(&self, buffer: &'static mut [u8], len: usize) {
+        // The request carries no data in this direction; the response does.
         if len < 2 {
             return self.send_negative(buffer, SID_TRANSFER_DATA, NRC_INCORRECT_LENGTH);
         }
-        if !self.download_active.get() {
+        let sequence = buffer[1];
+        let expected = self.next_block_sequence.get();
+
+        if sequence != expected {
+            if sequence == expected.wrapping_sub(1) && self.prev_block_len.get() > 0 {
+                // Re-send the last block. The tester lost our response, which
+                // is not an error on its part.
+                let address = self.prev_block_address.get();
+                let take = self.prev_block_len.get();
+                return self.upload_block(buffer, address, take);
+            }
+            return self.send_negative(
+                buffer,
+                SID_TRANSFER_DATA,
+                NRC_WRONG_BLOCK_SEQUENCE_COUNTER,
+            );
+        }
+
+        let remaining = self.transfer_remaining.get() as usize;
+        if remaining == 0 {
+            // Everything asked for has been handed over; the tester should
+            // have sent RequestTransferExit instead.
+            return self.send_negative(buffer, SID_TRANSFER_DATA, NRC_REQUEST_SEQUENCE_ERROR);
+        }
+
+        // One page at most, and never across a page boundary, so a block is
+        // always satisfied by a single read.
+        let address = self.transfer_address.get();
+        let page_size = self.page_size();
+        let offset = address as usize % page_size;
+        let take = core::cmp::min(core::cmp::min(page_size - offset, remaining), TRANSFER_BLOCK);
+
+        self.upload_block(buffer, address, take);
+    }
+
+    fn transfer_data(&self, buffer: &'static mut [u8], len: usize) {
+        match self.transfer.get() {
+            Transfer::Upload => return self.transfer_data_upload(buffer, len),
+            Transfer::None => {
+                return self.send_negative(
+                    buffer,
+                    SID_TRANSFER_DATA,
+                    NRC_REQUEST_SEQUENCE_ERROR,
+                )
+            }
+            Transfer::Download => {}
+        }
+        if len < 2 {
+            return self.send_negative(buffer, SID_TRANSFER_DATA, NRC_INCORRECT_LENGTH);
+        }
+        if self.transfer.get() != Transfer::Download {
             return self.send_negative(buffer, SID_TRANSFER_DATA, NRC_REQUEST_SEQUENCE_ERROR);
         }
         let sequence = buffer[1];
@@ -566,7 +738,7 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
         if data_len == 0 || data_len > TRANSFER_BLOCK {
             return self.send_negative(buffer, SID_TRANSFER_DATA, NRC_INCORRECT_LENGTH);
         }
-        if data_len as u32 > self.download_remaining.get() {
+        if data_len as u32 > self.transfer_remaining.get() {
             return self.send_negative(buffer, SID_TRANSFER_DATA, NRC_REQUEST_OUT_OF_RANGE);
         }
 
@@ -590,7 +762,7 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
             );
         }
 
-        let page_number = (self.download_address.get() as usize) / page_size;
+        let page_number = (self.transfer_address.get() as usize) / page_size;
         self.buffer.replace(buffer);
         self.job.set(Job::Write);
 
@@ -608,32 +780,39 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
                 return;
             }
             // Advance now; the completion only has to report it.
-            self.download_address
-                .set(self.download_address.get() + data_len as u32);
-            self.download_remaining
-                .set(self.download_remaining.get() - data_len as u32);
+            self.transfer_address
+                .set(self.transfer_address.get() + data_len as u32);
+            self.transfer_remaining
+                .set(self.transfer_remaining.get() - data_len as u32);
             self.next_block_sequence.set(expected.wrapping_add(1));
         }
     }
 
     fn request_transfer_exit(&self, buffer: &'static mut [u8], _len: usize) {
-        if !self.download_active.get() {
-            return self.send_negative(
-                buffer,
-                SID_REQUEST_TRANSFER_EXIT,
-                NRC_REQUEST_SEQUENCE_ERROR,
-            );
+        match self.transfer.get() {
+            Transfer::None => {
+                return self.send_negative(
+                    buffer,
+                    SID_REQUEST_TRANSFER_EXIT,
+                    NRC_REQUEST_SEQUENCE_ERROR,
+                )
+            }
+            Transfer::Download => {
+                if self.transfer_remaining.get() != 0 {
+                    // The tester stopped early; the image would be incomplete.
+                    self.transfer.set(Transfer::None);
+                    return self.send_negative(
+                        buffer,
+                        SID_REQUEST_TRANSFER_EXIT,
+                        NRC_TRANSFER_DATA_SUSPENDED,
+                    );
+                }
+            }
+            // Stopping a read early is the tester's business: nothing on the
+            // board is left half-finished by it, unlike an aborted download.
+            Transfer::Upload => {}
         }
-        if self.download_remaining.get() != 0 {
-            // The tester stopped early; the image would be incomplete.
-            self.download_active.set(false);
-            return self.send_negative(
-                buffer,
-                SID_REQUEST_TRANSFER_EXIT,
-                NRC_TRANSFER_DATA_SUSPENDED,
-            );
-        }
-        self.download_active.set(false);
+        self.transfer.set(Transfer::None);
         buffer[0] = SID_REQUEST_TRANSFER_EXIT + POSITIVE_RESPONSE_OFFSET;
         self.send(buffer, 1);
     }
@@ -822,6 +1001,44 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> hil::flash::Client<F>
                 crc: new_crc,
             });
             self.step();
+        } else if self.job.get() == Job::Read {
+            let page_size = pagebuffer.as_mut().len();
+            let address = self.prev_block_address.get();
+            let take = self.prev_block_len.get();
+            let offset = address as usize % page_size;
+
+            let copied = self.buffer.map_or(false, |buffer| {
+                if buffer.len() < 2 + take || offset + take > page_size {
+                    return false;
+                }
+                buffer[0] = SID_TRANSFER_DATA + POSITIVE_RESPONSE_OFFSET;
+                buffer[1] = self.next_block_sequence.get();
+                buffer[2..2 + take].copy_from_slice(&pagebuffer.as_mut()[offset..offset + take]);
+                true
+            });
+            self.page_buffer.replace(pagebuffer);
+            self.job.set(Job::None);
+
+            if let Some(buffer) = self.buffer.take() {
+                if !copied {
+                    return self.send_negative(
+                        buffer,
+                        SID_TRANSFER_DATA,
+                        NRC_GENERAL_PROGRAMMING_FAILURE,
+                    );
+                }
+                // Only advance once the block is built. A repeat of the same
+                // sequence number before this point therefore re-reads the
+                // same bytes rather than skipping ahead.
+                if address == self.transfer_address.get() {
+                    self.transfer_address.set(address + take as u32);
+                    self.transfer_remaining
+                        .set(self.transfer_remaining.get() - take as u32);
+                    self.next_block_sequence
+                        .set(self.next_block_sequence.get().wrapping_add(1));
+                }
+                self.send(buffer, 2 + take);
+            }
         } else {
             self.page_buffer.replace(pagebuffer);
         }
