@@ -63,6 +63,9 @@ impl flash::Flash for Sam71FlashDirect {
         page_number: usize,
         buf: &'static mut FiveTwelvePage,
     ) -> Result<(), (ErrorCode, &'static mut FiveTwelvePage)> {
+        // See `erase_page` for why the watchdog is petted here.
+        samv71q21b::wdt::Wdt::new().pet();
+
         let efc_buf = match self.efc_page.take() {
             Some(b) => b,
             None => return Err((ErrorCode::BUSY, buf)),
@@ -78,6 +81,20 @@ impl flash::Flash for Sam71FlashDirect {
     }
 
     fn erase_page(&self, page_number: usize) -> Result<(), ErrorCode> {
+        // Pet the watchdog per page, which is what makes a long erase safe.
+        //
+        // The EFC completes synchronously, and the servers above drive erases
+        // in a loop that never returns to the kernel's main loop -- so the
+        // main loop's own tickle does not happen for the whole duration. A
+        // 1792 KB application-region erase would take several seconds and
+        // could outlast the watchdog period; petting here bounds the gap to a
+        // single page operation instead of the whole command.
+        //
+        // Petting from the flash driver rather than from each caller is
+        // deliberate: it covers the UDS server, the tockloader protocol and
+        // anything added later, in one place that cannot be forgotten.
+        samv71q21b::wdt::Wdt::new().pet();
+
         self.efc.erase_page(page_number)
     }
 }

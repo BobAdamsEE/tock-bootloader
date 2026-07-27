@@ -46,13 +46,15 @@ const DFU_DBL_RESET_MAGIC: u32 = 0x5A1AD5;
 /// it climbing.
 ///
 /// What this does and does not give you is worth being precise about. The
-/// kernel's panic handler prints and **halts**; it does not reset. So the
-/// counter advances once per *reset*, not once per crash, and this is not
-/// automatic recovery from a boot loop. What it is, is an escape hatch that
-/// needs no debugger and no button: reset a board with a broken kernel three
-/// times and the fourth boot stays in the bootloader, ready to be reflashed.
-/// Adding a watchdog later would turn the same mechanism into genuine
-/// automatic recovery without changing anything here.
+/// kernel's panic handler prints and **halts**; it does not reset. So on its
+/// own this counts *resets*, not crashes -- an escape hatch needing no debugger
+/// and no button, rather than automatic recovery.
+///
+/// The watchdog (`samv71q21b::wdt`, armed by the bootloader) is what closes
+/// that gap: a kernel that stops reaching its main loop stops petting it and
+/// the chip resets, so the attempts accrue on their own. A kernel that halts in
+/// the panic handler still does not, since the handler runs with the core
+/// spinning rather than idle -- so both paths matter.
 const BOOT_ATTEMPT_LIMIT: u32 = 3;
 
 /// GPBR holding the boot-attempt counter. GPBR7 is the bootloader-entry magic.

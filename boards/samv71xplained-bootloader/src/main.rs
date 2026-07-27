@@ -19,6 +19,19 @@ mod flash_passthrough;
 const CAN_REQUEST_ID: u32 = 0x18DA_41F1;
 const CAN_RESPONSE_ID: u32 = 0x18DA_F141;
 
+/// Watchdog period, milliseconds.
+///
+/// Chosen against the slowest thing that legitimately runs without yielding,
+/// which is a flash erase: ~0.6 s for the 192 KB kernel region, so ~5.6 s if
+/// the whole 1792 KB application region is ever erased in one command. Eight
+/// seconds clears that with room to spare while still catching a hang in a
+/// useful time. The flash driver also pets the watchdog per page, so an erase
+/// of any size is bounded by a single page operation rather than by the total.
+///
+/// The counter is clocked at SLCK/128 and WDV is 12 bits, so 16 s is the
+/// ceiling; there is not much headroom above this value.
+const WATCHDOG_PERIOD_MS: u32 = 8000;
+
 /// Start of the kernel region; matches `prog` in layout.ld.
 const KERNEL_START: u32 = 0x0001_0000;
 
@@ -179,10 +192,17 @@ impl SyscallDriverLookup for Platform {
 
 #[no_mangle]
 pub unsafe fn main() {
-    // Disable the watchdog immediately. WDT_MR is write-once; the default
-    // ~16-second timeout can fire during crystal startup and reset the chip.
-    // WDT_MR = 0x400E1854, WDDIS = bit 15.
-    core::ptr::write_volatile(0x400E_1854 as *mut u32, 0x0000_8000);
+    // Arm the watchdog immediately, and note that this is the *only* chance to
+    // decide. WDT_MR is write-once: the bootloader jumps to the kernel without
+    // an intervening reset, so whatever is chosen here is what the kernel gets,
+    // and the kernel cannot change it.
+    //
+    // This used to write WDDIS, because the 16-second default could fire
+    // during crystal startup. WATCHDOG_PERIOD_MS is well clear of that, and
+    // `Wdt::start` sets WDIDLEHLT and WDDBGHLT so an idle bootloader waiting
+    // for a host, or a core halted in a debugger, does not reset. What resets
+    // is a core that is *spinning*, which is the case worth catching.
+    samv71q21b::wdt::Wdt::new().start(WATCHDOG_PERIOD_MS);
 
     // Change the flash slave's default master BEFORE any flash reads.
     // The I-Code bus as fixed default master (reset default) causes
