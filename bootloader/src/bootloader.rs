@@ -10,6 +10,7 @@ use kernel::utilities::cells::VolatileCell;
 use kernel::utilities::StaticRef;
 
 use crate::bootloader_crc;
+use crate::transport::{BootloaderTransport, BootloaderTransportClient};
 use crate::interfaces;
 
 // Main buffer that commands are received into and sent from.
@@ -20,7 +21,6 @@ pub static mut BUF: [u8; 600] = [0; 600];
 // byte before timing out and calling `receive_complete`.
 // At 16× oversampling and 115200 baud one byte takes 160 bit periods, so
 // the timeout must exceed that to avoid splitting multi-byte commands.
-const UART_RECEIVE_TIMEOUT: u8 = 250;
 
 // Get the addresses in flash of key components from the linker file.
 extern "C" {
@@ -140,8 +140,8 @@ impl<'a> BootloaderEnterer<'a> {
 }
 
 /// The main bootloader code.
-pub struct Bootloader<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'static> {
-    uart: &'a U,
+pub struct Bootloader<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'static> {
+    transport: &'a T,
     flash: &'a F,
     reset_function: &'a (dyn Fn() + 'a),
     page_buffer: TakeCell<'static, F::Page>,
@@ -155,16 +155,16 @@ pub struct Bootloader<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Fl
     bootloader_end_address: u32,
 }
 
-impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> Bootloader<'a, U, F> {
+impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> Bootloader<'a, T, F> {
     pub fn new(
-        uart: &'a U,
+        transport: &'a T,
         flash: &'a F,
         reset_function: &'a (dyn Fn() + 'a),
         page_buffer: &'static mut F::Page,
         buffer: &'static mut [u8],
-    ) -> Bootloader<'a, U, F> {
+    ) -> Bootloader<'a, T, F> {
         Bootloader {
-            uart: uart,
+            transport: transport,
             flash: flash,
             reset_function: reset_function,
             page_buffer: TakeCell::new(page_buffer),
@@ -178,19 +178,12 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> Bootloa
     }
 
     pub fn start(&self) {
-        // Setup UART and start listening.
-        let _ = self.uart.configure(hil::uart::Parameters {
-            baud_rate: 115200,
-            width: hil::uart::Width::Eight,
-            stop_bits: hil::uart::StopBits::One,
-            parity: hil::uart::Parity::None,
-            hw_flow_control: false,
-        });
+        // Bring the link up and start listening. What "a message" means on the
+        // wire is the transport's business; see `crate::transport`.
+        let _ = self.transport.configure();
 
         self.buffer.take().map(|buffer| {
-            let _ = self
-                .uart
-                .receive_automatic(buffer, buffer.len(), UART_RECEIVE_TIMEOUT);
+            let _ = self.transport.receive_message(buffer);
         });
     }
 
@@ -199,20 +192,15 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> Bootloa
         self.buffer.take().map(|buffer| {
             buffer[0] = ESCAPE_CHAR;
             buffer[1] = response;
-            let _ = self.uart.transmit_buffer(buffer, 2);
+            let _ = self.transport.transmit_message(buffer, 2);
         });
     }
 }
 
-impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::uart::TransmitClient
-    for Bootloader<'a, U, F>
+impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> BootloaderTransportClient
+    for Bootloader<'a, T, F>
 {
-    fn transmitted_buffer(
-        &self,
-        buffer: &'static mut [u8],
-        _tx_len: usize,
-        error: Result<(), ErrorCode>,
-    ) {
+    fn message_transmitted(&self, buffer: &'static mut [u8], error: Result<(), ErrorCode>) {
         if error.is_err() {
             // self.led.clear();
         } else {
@@ -229,8 +217,7 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::ua
                     if remaining_length == 0 {
                         self.state.set(State::Idle);
                         let _ =
-                            self.uart
-                                .receive_automatic(buffer, buffer.len(), UART_RECEIVE_TIMEOUT);
+                            self.transport.receive_message(buffer);
                     } else {
                         self.buffer.replace(buffer);
                         self.page_buffer.take().map(move |page| {
@@ -241,29 +228,20 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::ua
                 }
 
                 _ => {
-                    let _ = self
-                        .uart
-                        .receive_automatic(buffer, buffer.len(), UART_RECEIVE_TIMEOUT);
+                    let _ = self.transport.receive_message(buffer);
                 }
             }
         }
     }
-}
 
-impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::uart::ReceiveClient
-    for Bootloader<'a, U, F>
-{
-    fn received_buffer(
+    fn message_received(
         &self,
         buffer: &'static mut [u8],
         rx_len: usize,
         rval: Result<(), ErrorCode>,
-        _error: hil::uart::Error,
     ) {
         if rval.is_err() || rx_len == 0 {
-            let _ = self
-                .uart
-                .receive_automatic(buffer, buffer.len(), UART_RECEIVE_TIMEOUT);
+            let _ = self.transport.receive_message(buffer);
             return;
         }
 
@@ -325,7 +303,7 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::ua
                             buffer[1] = RES_BADARGS;
                             self.page_buffer.replace(page);
                             self.state.set(State::Idle);
-                            let _ = self.uart.transmit_buffer(buffer, 2);
+                            let _ = self.transport.transmit_message(buffer, 2);
                         } else if address >= self.bootloader_address
                             && address < self.bootloader_end_address
                         {
@@ -333,7 +311,7 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::ua
                             buffer[1] = RES_BADADDR;
                             self.page_buffer.replace(page);
                             self.state.set(State::Idle);
-                            let _ = self.uart.transmit_buffer(buffer, 2);
+                            let _ = self.transport.transmit_message(buffer, 2);
                         } else {
                             for i in 0..page_size {
                                 page.as_mut()[i] = data[i];
@@ -439,15 +417,13 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::ua
         }
 
         if let Some(buffer) = buf {
-            let _ = self
-                .uart
-                .receive_automatic(buffer, buffer.len(), UART_RECEIVE_TIMEOUT);
+            let _ = self.transport.receive_message(buffer);
         }
     }
 }
 
-impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::flash::Client<F>
-    for Bootloader<'a, U, F>
+impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> hil::flash::Client<F>
+    for Bootloader<'a, T, F>
 {
     fn read_complete(&self, pagebuffer: &'static mut F::Page, _result: Result<(), hil::flash::Error>) {
         match self.state.get() {
@@ -518,7 +494,7 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::fl
                     }
 
                     self.page_buffer.replace(pagebuffer);
-                    let _ = self.uart.transmit_buffer(buffer, 195);
+                    let _ = self.transport.transmit_message(buffer, 195);
                 });
             }
 
@@ -550,7 +526,7 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::fl
                     }
 
                     self.page_buffer.replace(pagebuffer);
-                    let _ = self.uart.transmit_buffer(buffer, j);
+                    let _ = self.transport.transmit_message(buffer, j);
                 });
             }
 
@@ -647,7 +623,7 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::fl
 
                     // And send the buffer to the client.
                     self.page_buffer.replace(pagebuffer);
-                    let _ = self.uart.transmit_buffer(buffer, index);
+                    let _ = self.transport.transmit_message(buffer, index);
                 });
             }
 
@@ -691,7 +667,7 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::fl
                         buffer[5] = ((new_crc >> 24) & 0xFF) as u8;
                         // And send the buffer to the client.
                         self.page_buffer.replace(pagebuffer);
-                        let _ = self.uart.transmit_buffer(buffer, 6);
+                        let _ = self.transport.transmit_message(buffer, 6);
                     });
                 } else {
                     // More CRC to do!
@@ -720,7 +696,7 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::fl
                 self.buffer.take().map(move |buffer| {
                     buffer[0] = ESCAPE_CHAR;
                     buffer[1] = RES_OK;
-                    let _ = self.uart.transmit_buffer(buffer, 2);
+                    let _ = self.transport.transmit_message(buffer, 2);
                 });
             }
 
@@ -730,7 +706,7 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::fl
                 self.buffer.take().map(move |buffer| {
                     buffer[0] = ESCAPE_CHAR;
                     buffer[1] = RES_OK;
-                    let _ = self.uart.transmit_buffer(buffer, 2);
+                    let _ = self.transport.transmit_message(buffer, 2);
                 });
             }
 
@@ -740,15 +716,13 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::fl
                 self.buffer.take().map(move |buffer| {
                     buffer[0] = ESCAPE_CHAR;
                     buffer[1] = RES_OK;
-                    let _ = self.uart.transmit_buffer(buffer, 2);
+                    let _ = self.transport.transmit_message(buffer, 2);
                 });
             }
 
             _ => {
                 self.buffer.take().map(|buffer| {
-                    let _ = self
-                        .uart
-                        .receive_automatic(buffer, buffer.len(), UART_RECEIVE_TIMEOUT);
+                    let _ = self.transport.receive_message(buffer);
                 });
             }
         }
@@ -762,15 +736,13 @@ impl<'a, U: hil::uart::UartAdvanced<'a> + 'a, F: hil::flash::Flash + 'a> hil::fl
                 self.buffer.take().map(move |buffer| {
                     buffer[0] = ESCAPE_CHAR;
                     buffer[1] = RES_OK;
-                    let _ = self.uart.transmit_buffer(buffer, 2);
+                    let _ = self.transport.transmit_message(buffer, 2);
                 });
             }
 
             _ => {
                 self.buffer.take().map(|buffer| {
-                    let _ = self
-                        .uart
-                        .receive_automatic(buffer, buffer.len(), UART_RECEIVE_TIMEOUT);
+                    let _ = self.transport.receive_message(buffer);
                 });
             }
         }

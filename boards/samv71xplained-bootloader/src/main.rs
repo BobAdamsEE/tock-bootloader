@@ -14,6 +14,11 @@
 
 mod flash_passthrough;
 
+/// CAN identifiers for the bootloader, ISO 15765-2 normal fixed addressing.
+/// Target 0x41, tester 0xF1. Not a legislated OBD-II address.
+const CAN_REQUEST_ID: u32 = 0x18DA_41F1;
+const CAN_RESPONSE_ID: u32 = 0x18DA_F141;
+
 use core::panic::PanicInfo;
 
 use kernel::capabilities;
@@ -111,8 +116,11 @@ fn bootloader_exit() {
 pub struct Platform {
     bootloader: &'static bootloader::bootloader::Bootloader<
         'static,
-        Usart1<'static>,
-        flash_passthrough::Sam71FlashDirect,
+        bootloader::uart_transport::UartTransport<'static, Usart1<'static>>,
+        bootloader::flash_router::FlashPort<
+            'static,
+            flash_passthrough::Sam71FlashDirect,
+        >,
     >,
     scheduler: &'static NullScheduler,
 }
@@ -220,7 +228,28 @@ pub unsafe fn main() {
     pmc::PMC.enable_peripheral_clock(xdmac::XDMAC_PID); // XDMAC for UART DMA receive
     pmc::PMC.enable_peripheral_clock(10); // PIOA — PA21 USART1 RXD
     pmc::PMC.enable_peripheral_clock(11); // PIOB — PB4  USART1 TXD
-    pmc::PMC.enable_peripheral_clock(12); // PIOC — PC9  LED1
+    pmc::PMC.enable_peripheral_clock(12); // PIOC — PC9 LED1, PC12/PC14 MCAN1
+
+    // MCAN1: peripheral clock + PCK5 as the CAN core clock. The SAMV71 MCAN
+    // takes its core clock from PCK5, not from a GCLK via PMC_PCR -- the
+    // PMC_PCR GCLKEN bit is simply ignored for this peripheral.
+    // PCK5 = PLLA / (14+1) = 20 MHz, which gives an exact 87.5% sample point
+    // at 500 kbps (40 TQ per bit). Same numbers as the kernel board.
+    pmc::PMC.enable_peripheral_clock(samv71q21b::mcan::MCAN1_PID);
+    pmc::PMC.configure_pck(5, 2, 14);
+
+    // TC0 channel 0 @ 32 kHz SLCK. The bootloader had no time source before;
+    // ISO-TP needs one for its N_Bs / N_Cr timeouts and separation time.
+    pmc::PMC.enable_peripheral_clock(samv71q21b::tc::TC0_CH0_PID);
+
+    // MCAN message RAM base (CCFG_CAN0 in the Matrix). The controller forms
+    // addresses as {CAN0DMABA[15:0], register_field[13:0], 2'b00}, so this
+    // must hold the upper 16 bits of the SRAM base or every message RAM
+    // access lands at 0x0000XXXX.
+    unsafe {
+        let ccfg_can0 = 0x4008_8110 as *mut u32;
+        core::ptr::write_volatile(ccfg_can0, 0x2040_0000u32);
+    }
 
     // -----------------------------------------------------------------------
     // Pin mux: USART1 EDBG CDC (PA21=RXD Periph A, PB4=TXD Periph D)
@@ -233,6 +262,10 @@ pub unsafe fn main() {
     }
     peripherals.pa.pin(21).select_peripheral(PeripheralFunction::A);
     peripherals.pb.pin(4).select_peripheral(PeripheralFunction::D);
+
+    // Pin mux: MCAN1 — PC12 = RX, PC14 = TX (both Peripheral C).
+    peripherals.pc.pin(12).select_peripheral(PeripheralFunction::C);
+    peripherals.pc.pin(14).select_peripheral(PeripheralFunction::C);
 
     // -----------------------------------------------------------------------
     // Kernel object
@@ -313,26 +346,183 @@ pub unsafe fn main() {
     );
 
     // -----------------------------------------------------------------------
-    // Bootloader core
+    // CAN transport (ISO-TP over MCAN1)
     // -----------------------------------------------------------------------
+    // ISO-TP sits between the raw controller and anything message-shaped. It
+    // owns the CAN transmit/receive clients and the alarm; layers above it deal
+    // only in whole messages.
+    //
+    // The bootloader has exactly one CAN client, so no virtualizer is needed.
+    // It does inherit the acceptance-filter work done for the kernel: with GFC
+    // set to reject unmatched frames, the filter installed here defines
+    // reception.
+    {
+        use kernel::hil::can::{Configure, Filter};
+
+        // Must be set while the peripheral is still Disabled. Without it the
+        // controller abandons a frame after one lost arbitration, which on a
+        // busy bus means requests silently vanish.
+        let _ = peripherals.mcan1.set_automatic_retransmission(true);
+        let _ = peripherals.mcan1.set_bitrate(500_000);
+        let _ = peripherals
+            .mcan1
+            .set_operation_mode(kernel::hil::can::OperationMode::Normal);
+
+        // Accept the physical request identifier addressed to this node.
+        // 29-bit normal fixed addressing: 0x18DA<target><source>, so
+        // 0x18DA41F1 is "tester 0xF1 -> target 0x41". Deliberately not an
+        // OBD-II legislated address: this board transmits as a tester at
+        // 0x18DB33F1 when running the kernel, and answering the legislated
+        // addresses would collide with real ECUs.
+        let _ = peripherals
+            .mcan1
+            .enable_filter(kernel::hil::can::FilterParameters {
+                number: 4,
+                scale_bits: kernel::hil::can::ScaleBits::Bits32,
+                identifier_mode: kernel::hil::can::IdentifierMode::List,
+                fifo_number: 0,
+                id: kernel::hil::can::Id::Extended(CAN_REQUEST_ID),
+                mask: 0x1FFF_FFFF,
+            });
+    }
+
+    let isotp_frame = static_init!(
+        [u8; kernel::hil::can::STANDARD_CAN_PACKET_SIZE],
+        [0; kernel::hil::can::STANDARD_CAN_PACKET_SIZE]
+    );
+    let isotp_rx_frame = static_init!(
+        [u8; kernel::hil::can::STANDARD_CAN_PACKET_SIZE],
+        [0; kernel::hil::can::STANDARD_CAN_PACKET_SIZE]
+    );
+    let isotp = static_init!(
+        bootloader::isotp::IsoTp<
+            'static,
+            samv71q21b::mcan::Mcan,
+            samv71q21b::tc::Tc<'static>,
+        >,
+        bootloader::isotp::IsoTp::new(
+            &peripherals.mcan1,
+            &peripherals.tc0,
+            kernel::hil::can::Id::Extended(CAN_REQUEST_ID),
+            kernel::hil::can::Id::Extended(CAN_RESPONSE_ID),
+            isotp_frame,
+            isotp_rx_frame,
+        )
+    );
+    kernel::hil::time::Alarm::set_alarm_client(&peripherals.tc0, isotp);
+    kernel::hil::can::Transmit::set_client(&peripherals.mcan1, Some(isotp));
+    kernel::hil::can::Receive::set_client(&peripherals.mcan1, Some(isotp));
+
+    let can_transport = static_init!(
+        bootloader::can_transport::CanTransport<
+            'static,
+            samv71q21b::mcan::Mcan,
+            samv71q21b::tc::Tc<'static>,
+        >,
+        bootloader::can_transport::CanTransport::new(&peripherals.mcan1, isotp)
+    );
+    isotp.set_client(can_transport);
+    kernel::hil::can::Controller::set_client(&peripherals.mcan1, Some(can_transport));
+
+
+    // -----------------------------------------------------------------------
+    // Two protocols, one per wire
+    // -----------------------------------------------------------------------
+    // CAN carries UDS -- the destination architecture. UART keeps speaking the
+    // tockloader protocol, because that is what stock `tockloader` speaks and
+    // it is the recovery channel: a botched CAN reflash must not take the way
+    // back with it.
+    //
+    // This supersedes `DualTransport`, which existed to put *one* protocol on
+    // both wires. With a different protocol per wire each server simply owns
+    // its own transport, so the mux is no longer in the path.
+    //
+    // Both servers drive the same flash, so it is virtualized. Only one host
+    // talks at a time in practice, and `MuxFlash` serializes the operations
+    // regardless.
+    let uart_transport = static_init!(
+        bootloader::uart_transport::UartTransport<'static, Usart1<'static>>,
+        bootloader::uart_transport::UartTransport::new(usart1)
+    );
+
+    // `capsules_core`'s MuxFlash cannot be used: it records the owning client
+    // only after issuing the operation, and this EFC completes inside the call.
+    // See bootloader::flash_router.
+    let flash_router = static_init!(
+        bootloader::flash_router::FlashRouter<'static, flash_passthrough::Sam71FlashDirect>,
+        bootloader::flash_router::FlashRouter::new(flash_adapter)
+    );
+    hil::flash::HasClient::set_client(flash_adapter, flash_router);
+
+    let flash_for_tockloader = static_init!(
+        bootloader::flash_router::FlashPort<'static, flash_passthrough::Sam71FlashDirect>,
+        bootloader::flash_router::FlashPort::new(
+            flash_router,
+            bootloader::flash_router::Which::A
+        )
+    );
+    let flash_for_uds = static_init!(
+        bootloader::flash_router::FlashPort<'static, flash_passthrough::Sam71FlashDirect>,
+        bootloader::flash_router::FlashPort::new(
+            flash_router,
+            bootloader::flash_router::Which::B
+        )
+    );
+
     let bootloader = static_init!(
         bootloader::bootloader::Bootloader<
             'static,
-            Usart1<'static>,
-            flash_passthrough::Sam71FlashDirect,
+            bootloader::uart_transport::UartTransport<'static, Usart1<'static>>,
+            bootloader::flash_router::FlashPort<
+                'static,
+                flash_passthrough::Sam71FlashDirect,
+            >,
         >,
         bootloader::bootloader::Bootloader::new(
-            usart1,
-            flash_adapter,
+            uart_transport,
+            flash_for_tockloader,
             &bootloader_exit,
             bl_page_buf,
             &mut bootloader::bootloader::BUF
         )
     );
 
-    hil::uart::Transmit::set_transmit_client(usart1, bootloader);
-    hil::uart::Receive::set_receive_client(usart1, bootloader);
-    hil::flash::HasClient::set_client(flash_adapter, bootloader);
+    let uds_page_buf = static_init!(
+        bootloader::flash_large_to_small::FiveTwelvePage,
+        bootloader::flash_large_to_small::FiveTwelvePage::default()
+    );
+    let uds_buf = static_init!([u8; 600], [0; 600]);
+
+    let uds = static_init!(
+        bootloader::uds::UdsServer<
+            'static,
+            bootloader::can_transport::CanTransport<
+                'static,
+                samv71q21b::mcan::Mcan,
+                samv71q21b::tc::Tc<'static>,
+            >,
+            bootloader::flash_router::FlashPort<
+                'static,
+                flash_passthrough::Sam71FlashDirect,
+            >,
+        >,
+        bootloader::uds::UdsServer::new(
+            can_transport,
+            flash_for_uds,
+            &bootloader_exit,
+            uds_page_buf,
+            uds_buf,
+            0x0004_0000, // application region start, alias addressing
+            0x0020_0000, // end of the 2 MB flash alias
+        )
+    );
+
+    hil::uart::Transmit::set_transmit_client(usart1, uart_transport);
+    hil::uart::Receive::set_receive_client(usart1, uart_transport);
+    bootloader::transport::BootloaderTransport::set_client(uart_transport, bootloader);
+    bootloader::transport::BootloaderTransport::set_client(can_transport, uds);
+    hil::flash::HasClient::set_client(flash_for_tockloader, bootloader);
+    hil::flash::HasClient::set_client(flash_for_uds, uds);
 
     // -----------------------------------------------------------------------
     // Chip and platform
@@ -357,14 +547,19 @@ pub unsafe fn main() {
     // (SUPC=0, RSTC=1, RTT=3 ...) firing spuriously causes a panic → loop{}.
     cortexm7::nvic::Nvic::new(14).enable(); // USART1 — EDBG CDC bootloader UART
     cortexm7::nvic::Nvic::new(58).enable(); // XDMAC  — DMA transfer complete
+    cortexm7::nvic::Nvic::new(samv71q21b::mcan::MCAN1_PID).enable(); // MCAN1 INT0
+    cortexm7::nvic::Nvic::new(38).enable(); // MCAN1 INT1
+    cortexm7::nvic::Nvic::new(samv71q21b::tc::TC0_CH0_PID).enable(); // TC0_CH0 — ISO-TP timers
     // EFC interrupt not needed — flash commands use synchronous IAP from ROM.
 
-    // Start the UART and begin listening for bootloader commands.
+    // Bring the transport up and begin listening for bootloader commands.
+    // Start both servers: the tockloader protocol on UART, UDS on CAN. Each
+    // brings its own transport up and posts a receive buffer.
     platform.bootloader.start();
+    uds.start();
 
-    // Register MCAN deferred call (created by DefaultPeripherals but unused
-    // in the bootloader). verify_setup requires created == registered.
     kernel::deferred_call::DeferredCallClient::register(&peripherals.mcan1);
+
 
     board_kernel.kernel_loop(
         &platform,
