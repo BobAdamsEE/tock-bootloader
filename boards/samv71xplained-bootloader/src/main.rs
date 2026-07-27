@@ -63,8 +63,8 @@ static BOOTLOADER_FLAGS: [u8; 36] = {
     let mut f = [0u8; 36];
     // Version "0.1.0"
     f[14] = b'0'; f[15] = b'.'; f[16] = b'1'; f[17] = b'.'; f[18] = b'0';
-    // Kernel start address: 0x00008000 (alias region, after 32 KB bootloader)
-    f[32] = 0x00; f[33] = 0x80; f[34] = 0x00; f[35] = 0x00; // little-endian
+    // Kernel start address: 0x00010000 (alias region, after 64 KB bootloader)
+    f[32] = 0x00; f[33] = 0x00; f[34] = 0x01; f[35] = 0x00; // little-endian
     f
 };
 
@@ -304,7 +304,8 @@ pub unsafe fn main() {
         bootloader::bootloader::BootloaderEnterer::new(
             bootloader_entry,
             bootloader_jumper,
-            bootloader_notifier
+            bootloader_notifier,
+            0x0001_0000, // kernel region start; see layout.ld
         )
     );
 
@@ -484,12 +485,12 @@ pub unsafe fn main() {
             &bootloader_exit,
             bl_page_buf,
             &mut bootloader::bootloader::BUF,
-            // Refuse writes and erases below the kernel: the whole 32 KB rom
+            // Refuse writes and erases below the kernel: the whole 64 KB rom
             // region is the bootloader's, including the vector table, the
-            // flags at 0x400 and the attribute table at 0x600. Matches the
-            // UDS server's floor in spirit, though that one starts higher
-            // still (see the design document, sections 13.4 and 13.5).
-            0x0000_8000,
+            // flags at 0x400 and the attribute table at 0x600. The UDS server
+            // uses the same floor (see the design document, sections 13.4,
+            // 13.5 and 14).
+            0x0001_0000,
         )
     );
 
@@ -518,7 +519,13 @@ pub unsafe fn main() {
             &bootloader_exit,
             uds_page_buf,
             uds_buf,
-            0x0004_0000, // application region start, alias addressing
+            0x0004_0000, // application region start, reported by DID 0xF200
+            // Lowest writable address: the end of the bootloader's own region,
+            // so the kernel is reachable over CAN. A development-tool
+            // decision -- seed/key is all that stands in front of it. Section
+            // 14 of the design document records why, and what the production
+            // variant does instead.
+            0x0001_0000,
             0x0020_0000, // end of the 2 MB flash alias
         )
     );

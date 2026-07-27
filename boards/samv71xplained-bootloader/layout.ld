@@ -1,10 +1,16 @@
 MEMORY
 {
-  /* Bootloader occupies the first 32 KB of flash (aliased at 0x00000000). */
-  rom  (rx)  : ORIGIN = 0x00000000, LENGTH = 32K
+  /* Bootloader occupies the first 64 KB of flash (aliased at 0x00000000).
+     Only ~24 KB is used today. The rest is reserved deliberately: adding
+     signature verification later costs about 12 KB, and growing this region
+     after the fact would move the kernel, which is the one change that cannot
+     be deployed over CAN or UART -- the bootloader doing the update is the
+     thing being replaced. Reserving now makes that a drop-in bootloader swap.
+     See the design document, section 14. */
+  rom  (rx)  : ORIGIN = 0x00000000, LENGTH = 64K
 
   /* Kernel image starts immediately after the bootloader. */
-  prog (rx)  : ORIGIN = 0x00008000, LENGTH = 2016K
+  prog (rx)  : ORIGIN = 0x00010000, LENGTH = 1984K
 
   /* SAMV71Q21B internal SRAM: 384 KB at 0x20400000–0x2045FFFF.
      Reserve the last 16 bytes for the double-reset scratch word. */

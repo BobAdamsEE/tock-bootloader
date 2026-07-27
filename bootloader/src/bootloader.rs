@@ -78,6 +78,11 @@ pub struct BootloaderEnterer<'a> {
     /// This is the address of flash where the flags region of the bootloader
     /// start. We need this to determine what address to jump to.
     bootloader_flags_address: u32,
+    /// Lowest address a kernel may start at: the end of the bootloader's own
+    /// region. Supplied by the board rather than hardcoded so it cannot drift
+    /// out of step with the region actually reserved — a stale constant would
+    /// either accept a kernel start inside the bootloader or reject a real one.
+    kernel_region_start: u32,
 }
 
 impl<'a> BootloaderEnterer<'a> {
@@ -85,12 +90,14 @@ impl<'a> BootloaderEnterer<'a> {
         entry_decider: &'a dyn interfaces::BootloaderEntry,
         jumper: &'a dyn interfaces::Jumper,
         active_notifier: &'a mut dyn interfaces::ActiveNotifier,
+        kernel_region_start: u32,
     ) -> BootloaderEnterer<'a> {
         BootloaderEnterer {
             entry_decider,
             jumper,
             active_notifier,
             bootloader_flags_address: unsafe { (&_flags_address as *const u8) as u32 },
+            kernel_region_start,
         }
     }
 
@@ -114,11 +121,16 @@ impl<'a> BootloaderEnterer<'a> {
 
         let start_address = start_address_ptr.get();
 
-        // Validate start_address before dereferencing it. The kernel lives in
-        // the alias flash range [0x8000, 0x200000). Values outside this range
-        // mean the flags region has never been written (zeroed) or is fully
-        // erased (0xFFFFFFFF), so no kernel is installed.
-        if start_address < 0x0000_8000 || start_address >= 0x0020_0000 {
+        // Validate start_address before dereferencing it. The kernel lives
+        // above the bootloader's own region and below the end of flash.
+        // Values outside that mean the flags region has never been written
+        // (zeroed) or is fully erased (0xFFFFFFFF), so no kernel is installed.
+        //
+        // The lower bound comes from the board rather than a constant so that
+        // it cannot drift out of step with the region actually reserved -- a
+        // kernel start inside the bootloader would be nonsense, and one just
+        // above a stale constant would jump into empty flash.
+        if start_address < self.kernel_region_start || start_address >= 0x0020_0000 {
             self.active_notifier.active();
             return;
         }

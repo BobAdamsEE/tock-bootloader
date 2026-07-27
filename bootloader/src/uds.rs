@@ -183,8 +183,24 @@ pub struct UdsServer<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash +
     stepping: Cell<bool>,
     step_again: Cell<bool>,
 
-    /// Where the application region starts, used to bound writes.
+    /// Where the application region starts. Reported by DID 0xF200, which
+    /// means "where do applications live" -- it is not a permission boundary,
+    /// and must not be confused with `write_floor` below.
     app_start: u32,
+    /// Lowest address any transfer, erase or CRC may touch.
+    ///
+    /// This is the end of the bootloader's own region, not the start of the
+    /// application region: the kernel is deliberately reachable, so that a
+    /// development board can be updated over CAN without a debugger. What
+    /// stays unreachable is the bootloader itself -- including the attribute
+    /// table, whose 8 KB erase block holds the vector table (design document
+    /// section 13.5).
+    ///
+    /// The kernel being writable from the bus is a development-tool decision,
+    /// taken knowing that seed/key is the only thing in front of it. Section
+    /// 14 records it, and the production variant closes it with signature
+    /// verification rather than by narrowing this.
+    write_floor: u32,
     flash_end: u32,
 }
 
@@ -196,6 +212,7 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
         page_buffer: &'static mut F::Page,
         buffer: &'static mut [u8],
         app_start: u32,
+        write_floor: u32,
         flash_end: u32,
     ) -> UdsServer<'a, T, F> {
         UdsServer {
@@ -216,6 +233,7 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
             stepping: Cell::new(false),
             step_again: Cell::new(false),
             app_start,
+            write_floor,
             flash_end,
         }
     }
@@ -523,7 +541,7 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
 
     fn range_ok(&self, address: u32, size: u32) -> bool {
         size > 0
-            && address >= self.app_start
+            && address >= self.write_floor
             && address.checked_add(size).map_or(false, |e| e <= self.flash_end)
     }
 
