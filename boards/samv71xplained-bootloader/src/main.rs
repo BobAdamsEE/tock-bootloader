@@ -359,7 +359,11 @@ pub unsafe fn main() {
     // recorded a digest for this image, which is the normal state after a
     // debugger flash. See kernel_integrity.rs.
     match bootloader::kernel_integrity::check(KERNEL_START, KERNEL_DESCRIPTOR) {
-        bootloader::kernel_integrity::Verdict::Mismatch => {
+        // Either the image does not match what was recorded, or a flash was
+        // started and never finished. Both mean the kernel cannot be trusted;
+        // hold the board here so it can be reflashed.
+        bootloader::kernel_integrity::Verdict::Mismatch
+        | bootloader::kernel_integrity::Verdict::Interrupted => {
             gpbr.set(samv71q21b::gpbr::GpbrIndex::Gpbr7, 0x90);
         }
         bootloader::kernel_integrity::Verdict::Match

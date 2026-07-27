@@ -35,20 +35,40 @@
 //!  16  32  SHA-256 of [kernel_start, kernel_start + length)
 //! ```
 //!
-//! # Absent means skip, deliberately
+//! # Three states, because absence is ambiguous
 //!
 //! A descriptor that is missing, erased or malformed yields
 //! [`Verdict::NoDescriptor`] and the board boots normally. That is a
 //! considered choice: flashing the kernel with a debugger writes no descriptor,
 //! and a check that bricked the board whenever someone used J-Link would be
-//! worse than no check at all. The cost is that the protection is opt-in --
-//! present only when the image was written by a tool that also wrote the
-//! descriptor.
+//! worse than no check at all.
+//!
+//! But failing open on absence leaves a hole, and it is exactly the power-loss
+//! case. If no descriptor exists -- immediately after a debugger flash, say --
+//! and a reflash is then interrupted half way, the board comes up with a
+//! truncated kernel and *no* record that anything went wrong, so it boots it.
+//! Absence cannot distinguish "nobody recorded a digest" from "somebody was
+//! part way through writing one".
+//!
+//! Hence a third state. A flashing tool writes [`MAGIC_IN_PROGRESS`] *before*
+//! touching the kernel and replaces it with the real descriptor afterwards, so
+//! an interruption at any point in between leaves a positive marker rather than
+//! silence, and [`Verdict::Interrupted`] holds the board in the bootloader.
+//!
+//! This depends on the flashing tool doing its half; `uds_flash.py` does. A
+//! tool that does not gets the same fail-open behaviour as a debugger flash,
+//! which is the honest fallback rather than a guarantee.
 
 use sha2::{Digest, Sha256};
 
-/// `"TKIV"` -- Tock Kernel Integrity Vector.
+/// `"TKIV"` -- Tock Kernel Integrity Vector. A complete descriptor.
 const MAGIC: u32 = 0x5649_4B54;
+
+/// `"TKIP"` -- the same descriptor mid-write. Written before the kernel is
+/// touched and replaced by [`MAGIC`] once the image is complete and verified,
+/// so that an interruption anywhere in between is detectable.
+pub const MAGIC_IN_PROGRESS: u32 = 0x5049_4B54;
+
 const VERSION: u32 = 1;
 
 /// Bytes the descriptor occupies. The page holding it is reserved entirely.
@@ -62,6 +82,9 @@ pub enum Verdict {
     Match,
     /// A descriptor is present and the image does not match it.
     Mismatch,
+    /// A flash was started and never finished. The image cannot be trusted
+    /// even if it happens to look plausible.
+    Interrupted,
 }
 
 /// Read `len` bytes of flash at `address`.
@@ -90,6 +113,13 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
 /// merely large.
 pub fn check(kernel_start: u32, descriptor_address: u32) -> Verdict {
     let descriptor = unsafe { flash(descriptor_address, DESCRIPTOR_LEN) };
+
+    // Checked before the version, and before anything else: a half-written
+    // descriptor may have nothing else valid in it, and the whole point is
+    // that this state is recognised without depending on the rest.
+    if u32_at(descriptor, 0) == MAGIC_IN_PROGRESS {
+        return Verdict::Interrupted;
+    }
 
     if u32_at(descriptor, 0) != MAGIC || u32_at(descriptor, 4) != VERSION {
         return Verdict::NoDescriptor;
