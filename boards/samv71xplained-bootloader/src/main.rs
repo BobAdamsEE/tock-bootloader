@@ -19,6 +19,27 @@ mod flash_passthrough;
 const CAN_REQUEST_ID: u32 = 0x18DA_41F1;
 const CAN_RESPONSE_ID: u32 = 0x18DA_F141;
 
+/// Start of the kernel region; matches `prog` in layout.ld.
+const KERNEL_START: u32 = 0x0001_0000;
+
+/// Page holding the kernel integrity descriptor.
+///
+/// Placement is more constrained than it looks. The kernel region has content
+/// at **both** ends: the image from 0x10000 (~87 KB), and Tock's kernel
+/// attributes block at the very top, ending at 0x40000 with a "TOCK" magic --
+/// which is how `tockloader` locates it. The descriptor has to miss both.
+///
+/// It also has to own its erase block outright. The EFC erases 16 pages (8 KB)
+/// at a time, so writing this page erases everything from 0x3C000 to 0x3E000;
+/// anything else living there would be destroyed. 0x3C000 is block-aligned and
+/// that block is empty in every build so far.
+///
+/// The bounds this assumes, both checked or enforced elsewhere:
+///   * the kernel image stays below 0x3C000 (176 KB; it is 87 KB today), and
+///     `kernel_integrity::check` refuses a descriptor claiming otherwise
+///   * the attributes block stays above 0x3E000
+const KERNEL_DESCRIPTOR: u32 = 0x0003_C000;
+
 use core::panic::PanicInfo;
 
 use kernel::capabilities;
@@ -308,6 +329,22 @@ pub unsafe fn main() {
             0x0001_0000, // kernel region start; see layout.ld
         )
     );
+
+    // Check the kernel image before considering a jump to it. A mismatch is
+    // reported by setting the ordinary bootloader-entry magic rather than by a
+    // separate path, so there is one way to say "stay resident" and the entry
+    // check clears it as usual.
+    //
+    // An absent or malformed descriptor is not a failure: it means nobody has
+    // recorded a digest for this image, which is the normal state after a
+    // debugger flash. See kernel_integrity.rs.
+    match bootloader::kernel_integrity::check(KERNEL_START, KERNEL_DESCRIPTOR) {
+        bootloader::kernel_integrity::Verdict::Mismatch => {
+            gpbr.set(samv71q21b::gpbr::GpbrIndex::Gpbr7, 0x90);
+        }
+        bootloader::kernel_integrity::Verdict::Match
+        | bootloader::kernel_integrity::Verdict::NoDescriptor => {}
+    }
 
     // Decides: jump to kernel, or stay in bootloader.
     bootloader_enterer.check();

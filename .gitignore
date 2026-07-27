@@ -3,3 +3,7 @@ target
 local_cargo
 Cargo.lock
 
+
+# Local flash artefacts: snapshots taken while debugging, not sources.
+*.bin.prev
+*.bin.onchip

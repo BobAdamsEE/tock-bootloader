@@ -8,3 +8,7 @@ edition = "2021"
 kernel = { path = "../../tock/kernel" }
 
 tock-bootloader-protocol = { path = "../protocol" }
+
+# Verification only, and only of a digest the board itself wrote -- see
+# kernel_integrity.rs for why this is not a security control.
+sha2 = { version = "0.10", default-features = false }

@@ -13,6 +13,7 @@ pub mod flash_large_to_small;
 pub mod flash_router;
 pub mod interfaces;
 pub mod isotp;
+pub mod kernel_integrity;
 pub mod null_scheduler;
 pub mod transport;
 pub mod uds;
