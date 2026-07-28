@@ -5,11 +5,27 @@
 //! send through Flow Control frames.
 //!
 //! ```text
-//!   single frame      0x0L data...              L <= 7
+//!   single frame      0x0L data...              L <= 7, classic form
+//!   single frame      0x00 LL data...           8 <= LL <= 62, CAN FD form
 //!   first frame       0x1H LL data...           length = HLL, 12 bits
 //!   consecutive frame 0x2S data...              S = sequence number, wraps 0..15
 //!   flow control      0x3F BS STmin             F = 0 clear-to-send, 1 wait, 2 overflow
 //! ```
+//!
+//! # CAN FD
+//!
+//! Frames carry up to 64 bytes, so a consecutive frame moves 63 payload bytes
+//! instead of 7 -- nine times the data per frame, and the data phase is clocked
+//! faster on top of that.
+//!
+//! Two things change beyond the buffer size. A single frame longer than 7 bytes
+//! cannot use the one-nibble length field, so ISO 15765-2 defines a second form
+//! with `0x00` followed by a real length byte; both are accepted on receive and
+//! the shorter one is used when it fits. And DLC is not linear above 8 bytes --
+//! there is no 9-byte frame -- so a frame that does not land on one of the
+//! sizes DLC can express is padded up to the next one. The padding is handled
+//! by the driver (`len_to_dlc` in `mcan.rs`) and ignored here, because the PCI
+//! carries the real length; that is precisely why ISO-TP tolerates it.
 //!
 //! Scope is deliberately narrow, because the bootloader is strictly
 //! request/response over one pair of identifiers:
@@ -18,7 +34,7 @@
 //!   several concurrent conversations.
 //! * Half duplex. A transmission is refused while a reception is in progress
 //!   and vice versa; the bootloader never does both at once.
-//! * Classic CAN only, so a consecutive frame carries 7 bytes.
+//! * CAN FD, so a consecutive frame carries 63 bytes.
 //!
 //! # Flow control we advertise
 //!
@@ -37,10 +53,12 @@ use kernel::hil::time::{Alarm, AlarmClient, ConvertTicks};
 use kernel::utilities::cells::{OptionalCell, TakeCell};
 use kernel::ErrorCode;
 
-/// Bytes carried by a classic CAN frame.
-const FRAME_LEN: usize = can::STANDARD_CAN_PACKET_SIZE;
-/// Payload bytes in a single frame (one PCI byte).
-const SF_MAX: usize = FRAME_LEN - 1;
+/// Bytes carried by a CAN FD frame.
+const FRAME_LEN: usize = can::FD_CAN_PACKET_SIZE;
+/// Largest single frame using the classic one-nibble length.
+const SF_MAX_SHORT: usize = 7;
+/// Largest single frame using the CAN FD two-byte form.
+const SF_MAX: usize = FRAME_LEN - 2;
 /// Payload bytes in a first frame (two PCI bytes).
 const FF_DATA: usize = FRAME_LEN - 2;
 /// Payload bytes in a consecutive frame (one PCI byte).
@@ -88,7 +106,7 @@ enum State {
     TxSeparation,
 }
 
-pub struct IsoTp<'a, C: can::Can + 'static, A: Alarm<'a> + 'a> {
+pub struct IsoTp<'a, C: can::CanFd + 'static, A: Alarm<'a> + 'a> {
     can: &'a C,
     alarm: &'a A,
 
@@ -123,7 +141,7 @@ pub struct IsoTp<'a, C: can::Can + 'static, A: Alarm<'a> + 'a> {
     tx_stmin_ms: Cell<u32>,
 }
 
-impl<'a, C: can::Can, A: Alarm<'a>> IsoTp<'a, C, A> {
+impl<'a, C: can::CanFd, A: Alarm<'a>> IsoTp<'a, C, A> {
     pub fn new(
         can: &'a C,
         alarm: &'a A,
@@ -210,14 +228,23 @@ impl<'a, C: can::Can, A: Alarm<'a>> IsoTp<'a, C, A> {
         self.tx_next_sn.set(1);
 
         if len <= SF_MAX {
-            // Single frame: the whole message fits alongside its PCI byte.
             let mut frame = [0u8; FRAME_LEN];
-            frame[0] = PCI_SF | (len as u8);
-            frame[1..1 + len].copy_from_slice(&buffer[..len]);
+            let frame_len = if len <= SF_MAX_SHORT {
+                // Classic form: length in the low nibble of the PCI byte.
+                frame[0] = PCI_SF | (len as u8);
+                frame[1..1 + len].copy_from_slice(&buffer[..len]);
+                1 + len
+            } else {
+                // CAN FD form: a zero nibble escapes to a real length byte.
+                frame[0] = PCI_SF;
+                frame[1] = len as u8;
+                frame[2..2 + len].copy_from_slice(&buffer[..len]);
+                2 + len
+            };
             self.tx_buffer.replace(buffer);
             self.tx_offset.set(len);
             self.state.set(State::TxSending);
-            self.send_frame(&frame);
+            self.send_frame(&frame, frame_len);
         } else {
             let mut frame = [0u8; FRAME_LEN];
             frame[0] = PCI_FF | ((len >> 8) as u8 & 0x0F);
@@ -226,17 +253,22 @@ impl<'a, C: can::Can, A: Alarm<'a>> IsoTp<'a, C, A> {
             self.tx_buffer.replace(buffer);
             self.tx_offset.set(FF_DATA);
             self.state.set(State::TxWaitFlowControl);
-            self.send_frame(&frame);
+            self.send_frame(&frame, FRAME_LEN);
             self.arm(N_BS_MS);
         }
         Ok(())
     }
 
-    /// Copy `data` into the scratch frame and hand it to the CAN driver.
-    fn send_frame(&self, data: &[u8; FRAME_LEN]) {
+    /// Copy `len` bytes into the scratch frame and hand it to the CAN driver.
+    ///
+    /// The length matters now that frames hold 64 bytes: sending a three-byte
+    /// flow control as a full frame would put 61 bytes of padding on the wire
+    /// every block. The driver rounds `len` up to the nearest DLC and zero-fills
+    /// the difference.
+    fn send_frame(&self, data: &[u8; FRAME_LEN], len: usize) {
         if let Some(frame) = self.frame.take() {
             frame.copy_from_slice(data);
-            if let Err((_e, frame)) = can::Transmit::send(self.can, self.tx_id, frame, FRAME_LEN) {
+            if let Err((_e, frame)) = can::Transmit::send(self.can, self.tx_id, frame, len) {
                 self.frame.replace(frame);
                 self.fail_transmit();
             }
@@ -248,7 +280,7 @@ impl<'a, C: can::Can, A: Alarm<'a>> IsoTp<'a, C, A> {
         frame[0] = PCI_FC | fs;
         frame[1] = RX_BLOCK_SIZE;
         frame[2] = RX_STMIN;
-        self.send_frame(&frame);
+        self.send_frame(&frame, 3);
     }
 
     /// Send the next consecutive frame of the message being transmitted.
@@ -271,7 +303,7 @@ impl<'a, C: can::Can, A: Alarm<'a>> IsoTp<'a, C, A> {
         }
 
         self.state.set(State::TxSending);
-        self.send_frame(&frame);
+        self.send_frame(&frame, 1 + take);
     }
 
     fn arm(&self, ms: u32) {
@@ -311,15 +343,23 @@ impl<'a, C: can::Can, A: Alarm<'a>> IsoTp<'a, C, A> {
     // -- Frame handling -----------------------------------------------------
 
     fn handle_single_frame(&self, data: &[u8; FRAME_LEN]) {
-        let len = (data[0] & 0x0F) as usize;
-        if len == 0 || len > SF_MAX {
+        // A zero length nibble is the CAN FD escape: the real length follows in
+        // the next byte and the payload starts one byte later.
+        let nibble = (data[0] & 0x0F) as usize;
+        let (len, offset) = if nibble == 0 {
+            (data[1] as usize, 2)
+        } else {
+            (nibble, 1)
+        };
+
+        if len == 0 || len > SF_MAX || offset + len > FRAME_LEN {
             return;
         }
         let fits = self.rx_buffer.map_or(false, |buffer| {
             if buffer.len() < len {
                 return false;
             }
-            buffer[..len].copy_from_slice(&data[1..1 + len]);
+            buffer[..len].copy_from_slice(&data[offset..offset + len]);
             true
         });
         if fits {
@@ -418,7 +458,7 @@ impl<'a, C: can::Can, A: Alarm<'a>> IsoTp<'a, C, A> {
     }
 }
 
-impl<'a, C: can::Can, A: Alarm<'a>> can::ReceiveClient<FRAME_LEN> for IsoTp<'a, C, A> {
+impl<'a, C: can::CanFd, A: Alarm<'a>> can::ReceiveClient<FRAME_LEN> for IsoTp<'a, C, A> {
     fn message_received(
         &self,
         id: can::Id,
@@ -450,7 +490,7 @@ impl<'a, C: can::Can, A: Alarm<'a>> can::ReceiveClient<FRAME_LEN> for IsoTp<'a, 
     }
 }
 
-impl<'a, C: can::Can, A: Alarm<'a>> can::TransmitClient<FRAME_LEN> for IsoTp<'a, C, A> {
+impl<'a, C: can::CanFd, A: Alarm<'a>> can::TransmitClient<FRAME_LEN> for IsoTp<'a, C, A> {
     fn transmit_complete(
         &self,
         status: Result<(), can::Error>,
@@ -490,7 +530,7 @@ impl<'a, C: can::Can, A: Alarm<'a>> can::TransmitClient<FRAME_LEN> for IsoTp<'a,
     }
 }
 
-impl<'a, C: can::Can, A: Alarm<'a>> AlarmClient for IsoTp<'a, C, A> {
+impl<'a, C: can::CanFd, A: Alarm<'a>> AlarmClient for IsoTp<'a, C, A> {
     fn alarm(&self) {
         match self.state.get() {
             State::TxSeparation => self.send_consecutive(),

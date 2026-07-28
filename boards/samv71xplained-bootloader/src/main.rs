@@ -426,6 +426,33 @@ pub unsafe fn main() {
         // busy bus means requests silently vanish.
         let _ = peripherals.mcan1.set_automatic_retransmission(true);
         let _ = peripherals.mcan1.set_bitrate(500_000);
+
+        // CAN FD: 500 kbit/s arbitration, 2 Mbit/s data phase.
+        //
+        // PCK5 is 20 MHz, so 2 Mbit/s is 10 time quanta. Segments are written
+        // in the register's "minus one" encoding, hence 6 and 1 for 7 and 2:
+        //
+        //   1 (sync) + 7 (seg1) + 2 (seg2) = 10 tq  ->  20 MHz / 10 = 2 Mbit/s
+        //   sample point (1 + 7) / 10 = 80%
+        //
+        // 80% rather than the arbitration phase's 87.5% because the data phase
+        // has no arbitration to resolve and a slightly earlier sample buys
+        // tolerance to the transceiver loop delay. Setting this is also what
+        // puts the driver into FD mode -- there is no separate switch.
+        let _ = kernel::hil::can::ConfigureFd::set_payload_bit_timing(
+            &peripherals.mcan1,
+            kernel::hil::can::BitTiming {
+                segment1: 6,
+                segment2: 1,
+                // M_CAN folds propagation delay into DTSEG1; there is no
+                // separate field in DBTP, so this stays zero and the delay is
+                // already accounted for in segment1 above.
+                propagation: 0,
+                sync_jump_width: 0,
+                baud_rate_prescaler: 0,
+            },
+        );
+
         let _ = peripherals
             .mcan1
             .set_operation_mode(kernel::hil::can::OperationMode::Normal);
@@ -449,12 +476,12 @@ pub unsafe fn main() {
     }
 
     let isotp_frame = static_init!(
-        [u8; kernel::hil::can::STANDARD_CAN_PACKET_SIZE],
-        [0; kernel::hil::can::STANDARD_CAN_PACKET_SIZE]
+        [u8; kernel::hil::can::FD_CAN_PACKET_SIZE],
+        [0; kernel::hil::can::FD_CAN_PACKET_SIZE]
     );
     let isotp_rx_frame = static_init!(
-        [u8; kernel::hil::can::STANDARD_CAN_PACKET_SIZE],
-        [0; kernel::hil::can::STANDARD_CAN_PACKET_SIZE]
+        [u8; kernel::hil::can::FD_CAN_PACKET_SIZE],
+        [0; kernel::hil::can::FD_CAN_PACKET_SIZE]
     );
     let isotp = static_init!(
         bootloader::isotp::IsoTp<

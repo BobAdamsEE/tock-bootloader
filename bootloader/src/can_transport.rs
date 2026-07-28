@@ -24,13 +24,13 @@ use kernel::ErrorCode;
 use crate::isotp::{IsoTp, IsoTpClient};
 use crate::transport::{BootloaderTransport, BootloaderTransportClient};
 
-pub struct CanTransport<'a, C: can::Can + 'static, A: Alarm<'a> + 'a> {
+pub struct CanTransport<'a, C: can::CanFd + can::Controller + 'static, A: Alarm<'a> + 'a> {
     can: &'a C,
     isotp: &'a IsoTp<'a, C, A>,
     client: OptionalCell<&'a dyn BootloaderTransportClient>,
 }
 
-impl<'a, C: can::Can, A: Alarm<'a>> CanTransport<'a, C, A> {
+impl<'a, C: can::CanFd + can::Controller, A: Alarm<'a>> CanTransport<'a, C, A> {
     pub fn new(can: &'a C, isotp: &'a IsoTp<'a, C, A>) -> CanTransport<'a, C, A> {
         CanTransport {
             can,
@@ -40,7 +40,7 @@ impl<'a, C: can::Can, A: Alarm<'a>> CanTransport<'a, C, A> {
     }
 }
 
-impl<'a, C: can::Can, A: Alarm<'a>> BootloaderTransport<'a> for CanTransport<'a, C, A> {
+impl<'a, C: can::CanFd + can::Controller, A: Alarm<'a>> BootloaderTransport<'a> for CanTransport<'a, C, A> {
     fn set_client(&self, client: &'a dyn BootloaderTransportClient) {
         self.client.set(client);
     }
@@ -68,7 +68,7 @@ impl<'a, C: can::Can, A: Alarm<'a>> BootloaderTransport<'a> for CanTransport<'a,
     }
 }
 
-impl<'a, C: can::Can, A: Alarm<'a>> IsoTpClient for CanTransport<'a, C, A> {
+impl<'a, C: can::CanFd + can::Controller, A: Alarm<'a>> IsoTpClient for CanTransport<'a, C, A> {
     fn message_transmitted(&self, buffer: &'static mut [u8], result: Result<(), ErrorCode>) {
         self.client
             .map(move |client| client.message_transmitted(buffer, result));
@@ -85,7 +85,7 @@ impl<'a, C: can::Can, A: Alarm<'a>> IsoTpClient for CanTransport<'a, C, A> {
     }
 }
 
-impl<'a, C: can::Can, A: Alarm<'a>> can::ControllerClient for CanTransport<'a, C, A> {
+impl<'a, C: can::CanFd + can::Controller, A: Alarm<'a>> can::ControllerClient for CanTransport<'a, C, A> {
     fn state_changed(&self, _state: can::State) {}
 
     fn enabled(&self, status: Result<(), ErrorCode>) {
