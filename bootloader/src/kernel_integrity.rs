@@ -111,6 +111,21 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
 /// `descriptor_address` is also the upper bound on the image: the descriptor
 /// sits above the kernel, so a length reaching it is malformed rather than
 /// merely large.
+/// Like [`check`], but also reports the image length the descriptor claims.
+///
+/// Rollback needs the length as well as the verdict, and reading the descriptor
+/// twice would leave room for the two answers to disagree.
+pub fn describe(kernel_start: u32, descriptor_address: u32) -> (Verdict, usize) {
+    let verdict = check(kernel_start, descriptor_address);
+    let descriptor = unsafe { flash(descriptor_address, DESCRIPTOR_LEN) };
+    let length = if verdict == Verdict::Match {
+        u32_at(descriptor, 8) as usize
+    } else {
+        0
+    };
+    (verdict, length)
+}
+
 pub fn check(kernel_start: u32, descriptor_address: u32) -> Verdict {
     let descriptor = unsafe { flash(descriptor_address, DESCRIPTOR_LEN) };
 

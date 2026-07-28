@@ -53,6 +53,19 @@ const KERNEL_START: u32 = 0x0001_0000;
 ///   * the attributes block stays above 0x3E000
 const KERNEL_DESCRIPTOR: u32 = 0x0003_C000;
 
+/// Cold backup of the kernel, never executed where it lies.
+///
+/// The kernel is linked EXEC at KERNEL_START and is not position independent,
+/// so this cannot simply be booted in place -- rollback copies it down over the
+/// active slot. It mirrors the active region byte for byte, including the
+/// descriptor at the same offset, so that any kernel fitting one fits the
+/// other and the same `kernel_integrity::check` works on both.
+const KERNEL_BACKUP: u32 = 0x0004_0000;
+const KERNEL_BACKUP_DESCRIPTOR: u32 = KERNEL_BACKUP + (KERNEL_DESCRIPTOR - KERNEL_START);
+
+/// End of the kernel region, and the size the backup mirrors.
+const KERNEL_REGION_END: u32 = 0x0004_0000;
+
 use core::panic::PanicInfo;
 
 use kernel::capabilities;
@@ -126,11 +139,11 @@ static BOARD_ATTRIBUTES: [u8; 256] = {
     d[137] = b'A'; d[138] = b'T'; d[139] = b'S'; d[140] = b'A';
     d[141] = b'M'; d[142] = b'V'; d[143] = b'7'; d[144] = b'1';
     d[145] = b'Q'; d[146] = b'2'; d[147] = b'1'; d[148] = b'B';
-    // Attribute 3: appaddr = "0x40000"
+    // Attribute 3: appaddr = "0x70000"
     d[192] = b'a'; d[193] = b'p'; d[194] = b'p'; d[195] = b'a';
     d[196] = b'd'; d[197] = b'd'; d[198] = b'r';
     d[200] = 7;
-    d[201] = b'0'; d[202] = b'x'; d[203] = b'4'; d[204] = b'0';
+    d[201] = b'0'; d[202] = b'x'; d[203] = b'7'; d[204] = b'0';
     d[205] = b'0'; d[206] = b'0'; d[207] = b'0';
     d
 };
@@ -141,6 +154,66 @@ static BOARD_ATTRIBUTES: [u8; 256] = {
 // ---------------------------------------------------------------------------
 fn bootloader_exit() {
     unsafe { cortexm7::scb::reset(); }
+}
+
+/// Static page buffer for the slot copier. One buffer, taken and returned per
+/// page; see `kernel_slot`.
+static mut ROLLBACK_PAGE: samv71q21b::efc::Sam71Page =
+    samv71q21b::efc::Sam71Page([0; samv71q21b::efc::PAGE_SIZE]);
+
+/// Restore the backup over the active slot, if the backup is worth restoring.
+///
+/// Returns whether the caller should carry on booting. `false` means there was
+/// nothing good to fall back to, and the board should hold in the bootloader.
+///
+/// Runs before any of the servers are wired up, which is deliberate: this is
+/// the last chance to fix the kernel before the decision to jump, and the EFC
+/// is already initialised by this point. It does not return on success -- the
+/// board resets so the whole entry sequence, integrity check included, runs
+/// again against the restored image rather than trusting this copy blindly.
+fn try_rollback(efc: &'static Efc) -> bool {
+    use bootloader::kernel_integrity::Verdict;
+
+    // Only roll back to something that passes the same check the active slot
+    // just failed. A backup that is itself corrupt is not an improvement.
+    let (length, ok) = match bootloader::kernel_integrity::describe(
+        KERNEL_BACKUP,
+        KERNEL_BACKUP_DESCRIPTOR,
+    ) {
+        (Verdict::Match, len) => (len, true),
+        _ => (0, false),
+    };
+    if !ok {
+        return false;
+    }
+
+    let copier = unsafe {
+        let page = &mut *core::ptr::addr_of_mut!(ROLLBACK_PAGE);
+        static_init!(
+            bootloader::kernel_slot::SlotCopier<'static, Efc>,
+            bootloader::kernel_slot::SlotCopier::new(efc, page)
+        )
+    };
+    hil::flash::HasClient::set_client(efc, copier);
+
+    // The image first, then the descriptor that vouches for it. Losing power
+    // between the two leaves the active slot without a valid descriptor, which
+    // reads as "do not trust this" rather than as a stale claim that a
+    // half-copied image is fine.
+    let bytes = (KERNEL_REGION_END - KERNEL_START) as usize;
+    if copier.copy(KERNEL_BACKUP, KERNEL_START, bytes).is_err() {
+        return false;
+    }
+    let _ = length;
+
+    // The descriptor came across with the rest of the region, since it lives at
+    // the same offset in both slots -- so the active slot now describes itself
+    // correctly with no extra write.
+    unsafe {
+        cortexm7::scb::reset();
+    }
+    #[allow(unreachable_code)]
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -360,11 +433,14 @@ pub unsafe fn main() {
     // debugger flash. See kernel_integrity.rs.
     match bootloader::kernel_integrity::check(KERNEL_START, KERNEL_DESCRIPTOR) {
         // Either the image does not match what was recorded, or a flash was
-        // started and never finished. Both mean the kernel cannot be trusted;
-        // hold the board here so it can be reflashed.
+        // started and never finished. Both mean the kernel cannot be trusted.
         bootloader::kernel_integrity::Verdict::Mismatch
         | bootloader::kernel_integrity::Verdict::Interrupted => {
-            gpbr.set(samv71q21b::gpbr::GpbrIndex::Gpbr7, 0x90);
+            // Roll back if there is a known-good backup to roll back to.
+            // Failing that, hold here so it can be reflashed by hand.
+            if !try_rollback(&peripherals.efc) {
+                gpbr.set(samv71q21b::gpbr::GpbrIndex::Gpbr7, 0x90);
+            }
         }
         bootloader::kernel_integrity::Verdict::Match
         | bootloader::kernel_integrity::Verdict::NoDescriptor => {}
@@ -607,7 +683,7 @@ pub unsafe fn main() {
             &bootloader_exit,
             uds_page_buf,
             uds_buf,
-            0x0004_0000, // application region start, reported by DID 0xF200
+            0x0007_0000, // application region start, reported by DID 0xF200
             // Lowest writable address: the end of the bootloader's own region,
             // so the kernel is reachable over CAN. A development-tool
             // decision -- seed/key is all that stands in front of it. Section

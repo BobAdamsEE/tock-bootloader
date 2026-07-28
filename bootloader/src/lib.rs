@@ -14,6 +14,7 @@ pub mod flash_router;
 pub mod interfaces;
 pub mod isotp;
 pub mod kernel_integrity;
+pub mod kernel_slot;
 pub mod null_scheduler;
 pub mod transport;
 pub mod uds;
