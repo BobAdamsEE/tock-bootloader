@@ -28,6 +28,25 @@
 //! there is no listing installed applications, no inspecting them, and no
 //! reading an image back to verify it.
 //!
+//! # Attributes
+//!
+//! `tockloader` reads the board's attribute table -- `board`, `arch`,
+//! `appaddr` and friends -- before almost every command, and its serial channel
+//! already fetches them through protocol commands rather than by reading flash
+//! directly. This server does the same over UDS: one vendor DID per record,
+//! `0xF2A0 + index`. That keeps the raw addresses of the table out of the write
+//! range entirely, which matters because the table sits inside the bootloader's
+//! own erase block.
+//!
+//! Two addresses sit alongside them and are easy to confuse:
+//!
+//! ```text
+//!   0xF200  application region start   where applications live; fixed by the
+//!                                      build, so read-only
+//!   0xF201  kernel start address       where the bootloader jumps; lives in
+//!                                      the flags, so writable
+//! ```
+//!
 //! # Response pending
 //!
 //! Erasing and CRC-checking take far longer than P2 (50 ms), so both answer
@@ -97,6 +116,34 @@ const ROUTINE_START: u8 = 0x01;
 const DID_BOOT_SOFTWARE_IDENTIFICATION: u16 = 0xF180;
 const DID_ACTIVE_SESSION: u16 = 0xF186;
 const DID_APPLICATION_START_ADDRESS: u16 = 0xF200;
+/// Where the bootloader jumps. Deliberately a different identifier from
+/// `0xF200`: that one answers "where do applications live" and is fixed by the
+/// build, this one is the kernel entry stored in the flags, and the two have
+/// been confused before precisely because they were once the same number.
+const DID_KERNEL_START_ADDRESS: u16 = 0xF201;
+/// One DID per attribute record, `DID_ATTRIBUTE_BASE + index`. Chosen above the
+/// runtime application's 0xF210-0xF212 so a single DID map covers both.
+const DID_ATTRIBUTE_BASE: u16 = 0xF2A0;
+/// How many records `tockloader` iterates over.
+const ATTRIBUTE_COUNT: u16 = 16;
+const DID_ATTRIBUTE_LAST: u16 = DID_ATTRIBUTE_BASE + ATTRIBUTE_COUNT - 1;
+/// One record: an 8-byte key, a 1-byte value length, and 55 bytes of value.
+const ATTRIBUTE_RECORD: usize = 64;
+
+/// Where the start address lives inside the bootloader flags, little-endian.
+const FLAGS_START_ADDRESS_OFFSET: usize = 32;
+
+/// Pages in one flash erase block.
+///
+/// The flash driver erases a whole block before writing a page that is not
+/// already blank, so a single-page write into the attribute table takes the
+/// vector table, the flags and the start of the bootloader's own text with it.
+/// That is why a write here stages the entire block in RAM, patches it, and
+/// writes it back page by page in ascending order: the first write triggers the
+/// one erase and the rest find the block already clean.
+///
+/// Staging is necessary but not sufficient -- see `block_is_self`.
+const BLOCK_PAGES: usize = 16;
 
 /// Payload bytes per `TransferData`, chosen to be exactly one flash page so a
 /// block maps to a single write with no buffering in between.
@@ -128,6 +175,16 @@ enum Transfer {
     Upload,
 }
 
+/// Whether a staged block rewrite can go ahead.
+#[derive(Copy, Clone, PartialEq)]
+enum Stage {
+    Ready,
+    /// The block holds the running bootloader; see `block_is_self`.
+    WouldEraseSelf,
+    /// Bad bounds or no staging buffer -- a bug rather than a layout fact.
+    Unusable,
+}
+
 /// What the server is doing between receiving a request and answering it.
 #[derive(Copy, Clone, PartialEq)]
 enum Job {
@@ -138,6 +195,13 @@ enum Job {
     Write,
     /// Reading the page that answers one upload block.
     Read,
+    /// Reading the page that holds a flash-backed identifier.
+    DidRead,
+    /// 0x78 sent; copying the erase block into the staging buffer, `page` of
+    /// `end`, before patching it.
+    StageRead { page: usize, end: usize },
+    /// Writing the patched staging buffer back, `page` of `end`.
+    StageWrite { page: usize, end: usize },
     /// 0x78 sent; CRC over `address` for `remaining` more bytes.
     Crc {
         address: u32,
@@ -156,6 +220,9 @@ pub struct UdsServer<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash +
     page_buffer: TakeCell<'static, F::Page>,
     /// The message buffer, held while a job runs.
     buffer: TakeCell<'static, [u8]>,
+    /// One erase block of RAM, used only while rewriting the attribute table or
+    /// the flags. See `BLOCK_PAGES`.
+    stage: TakeCell<'static, [u8]>,
 
     session: Cell<u8>,
     security: Cell<Security>,
@@ -172,6 +239,26 @@ pub struct UdsServer<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash +
     /// upload direction has to re-read, which needs these.
     prev_block_address: Cell<u32>,
     prev_block_len: Cell<usize>,
+
+    /// The identifier a deferred `0x22` or `0x2E` is answering, so the response
+    /// can echo it once the flash work finishes.
+    pending_did: Cell<u16>,
+    /// What a `DidRead` is fetching: where, how much, and whether to reverse it
+    /// on the way out. The flags store the start address little-endian while
+    /// UDS puts addresses on the wire big-endian, so that one is reversed and
+    /// the attribute records are not.
+    did_address: Cell<u32>,
+    did_len: Cell<usize>,
+    did_reverse: Cell<bool>,
+    /// The bytes a staged rewrite will patch in, and how many of them are
+    /// meaningful. Held here rather than in the message buffer because that
+    /// buffer is reused to send the 0x78 before the work starts.
+    patch: Cell<[u8; ATTRIBUTE_RECORD]>,
+    patch_len: Cell<usize>,
+    /// Where the patch goes within the staging buffer, and which flash page the
+    /// buffer starts at.
+    patch_offset: Cell<usize>,
+    stage_first_page: Cell<usize>,
 
     /// Guards against recursing once per page.
     ///
@@ -202,6 +289,16 @@ pub struct UdsServer<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash +
     /// verification rather than by narrowing this.
     write_floor: u32,
     flash_end: u32,
+    /// The attribute table and the bootloader flags. Reachable through their
+    /// DIDs only: both sit below `write_floor`, so no transfer, erase or CRC
+    /// can name them by address.
+    attributes_address: u32,
+    flags_address: u32,
+    /// End of the bootloader's own vectors and text (`_etext`).
+    ///
+    /// A staged rewrite refuses any erase block below this; see
+    /// `block_is_self`.
+    text_end: u32,
 }
 
 impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
@@ -211,9 +308,13 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
         reset_function: &'a (dyn Fn() + 'a),
         page_buffer: &'static mut F::Page,
         buffer: &'static mut [u8],
+        stage: &'static mut [u8],
         app_start: u32,
         write_floor: u32,
         flash_end: u32,
+        attributes_address: u32,
+        flags_address: u32,
+        text_end: u32,
     ) -> UdsServer<'a, T, F> {
         UdsServer {
             transport,
@@ -221,6 +322,7 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
             reset_function,
             page_buffer: TakeCell::new(page_buffer),
             buffer: TakeCell::new(buffer),
+            stage: TakeCell::new(stage),
             session: Cell::new(SESSION_DEFAULT),
             security: Cell::new(Security::Locked),
             job: Cell::new(Job::None),
@@ -232,10 +334,41 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
             next_block_sequence: Cell::new(1),
             stepping: Cell::new(false),
             step_again: Cell::new(false),
+            pending_did: Cell::new(0),
+            did_address: Cell::new(0),
+            did_len: Cell::new(0),
+            did_reverse: Cell::new(false),
+            patch: Cell::new([0; ATTRIBUTE_RECORD]),
+            patch_len: Cell::new(0),
+            patch_offset: Cell::new(0),
+            stage_first_page: Cell::new(0),
             app_start,
             write_floor,
             flash_end,
+            attributes_address,
+            flags_address,
+            text_end,
         }
+    }
+
+    /// Would rewriting the erase block at `block_start` destroy the code doing
+    /// the rewriting?
+    ///
+    /// Established on hardware, 2026-07-28. Staging the block in RAM is not
+    /// enough on its own: the erase takes effect immediately, and on this
+    /// layout the block that holds the attribute table also holds the vector
+    /// table and the first pages of the bootloader's `.text`. The instruction
+    /// cache carried execution just far enough to write page 0 back before the
+    /// next fetch missed and found erased flash. Fifteen pages stayed blank and
+    /// the board needed a debugger.
+    ///
+    /// So the rule is narrower than "stage it": a block may be rewritten only
+    /// if the bootloader is not executing out of it. That is a property of
+    /// where the linker put things, which is why it is checked here rather than
+    /// assumed -- move the attribute table above `_etext` and these writes
+    /// begin working with no change to this file.
+    fn block_is_self(&self, block_start: usize) -> bool {
+        block_start < self.text_end as usize
     }
 
     pub fn start(&self) {
@@ -385,11 +518,73 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
                 buffer[3..7].copy_from_slice(&addr.to_be_bytes());
                 self.send(buffer, 7);
             }
+            DID_KERNEL_START_ADDRESS => {
+                let address = self.flags_address as usize + FLAGS_START_ADDRESS_OFFSET;
+                self.read_from_flash(buffer, did, address, 4, true);
+            }
+            DID_ATTRIBUTE_BASE..=DID_ATTRIBUTE_LAST => {
+                // Unrestricted, like the other identification DIDs: reading the
+                // table is what `tockloader` does before it knows whether it
+                // even wants to program anything, and it changes nothing.
+                let index = (did - DID_ATTRIBUTE_BASE) as usize;
+                let address = self.attributes_address as usize + index * ATTRIBUTE_RECORD;
+                self.read_from_flash(buffer, did, address, ATTRIBUTE_RECORD, false);
+            }
             _ => self.send_negative(
                 buffer,
                 SID_READ_DATA_BY_IDENTIFIER,
                 NRC_REQUEST_OUT_OF_RANGE,
             ),
+        }
+    }
+
+    /// Answer a DID from flash.
+    ///
+    /// Everything reachable this way -- attribute records and the flags -- sits
+    /// wholly inside one page, so a single read serves the whole response.
+    fn read_from_flash(
+        &self,
+        buffer: &'static mut [u8],
+        did: u16,
+        address: usize,
+        len: usize,
+        reverse: bool,
+    ) {
+        let page_size = self.page_size();
+        if address % page_size + len > page_size || buffer.len() < 3 + len {
+            return self.send_negative(
+                buffer,
+                SID_READ_DATA_BY_IDENTIFIER,
+                NRC_GENERAL_PROGRAMMING_FAILURE,
+            );
+        }
+
+        self.pending_did.set(did);
+        self.did_address.set(address as u32);
+        self.did_len.set(len);
+        self.did_reverse.set(reverse);
+        self.job.set(Job::DidRead);
+        self.buffer.replace(buffer);
+
+        let failed = match self.page_buffer.take() {
+            Some(page) => match self.flash.read_page(address / page_size, page) {
+                Ok(()) => false,
+                Err((_e, page)) => {
+                    self.page_buffer.replace(page);
+                    true
+                }
+            },
+            None => true,
+        };
+        if failed {
+            self.job.set(Job::None);
+            if let Some(buffer) = self.buffer.take() {
+                self.send_negative(
+                    buffer,
+                    SID_READ_DATA_BY_IDENTIFIER,
+                    NRC_GENERAL_PROGRAMMING_FAILURE,
+                );
+            }
         }
     }
 
@@ -453,13 +648,141 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
                 NRC_SECURITY_ACCESS_DENIED,
             );
         }
-        // No writable identifiers yet; the service exists so a tester sees a
-        // well-formed refusal rather than "service not supported".
-        self.send_negative(
-            buffer,
-            SID_WRITE_DATA_BY_IDENTIFIER,
-            NRC_REQUEST_OUT_OF_RANGE,
-        )
+        let did = ((buffer[1] as u16) << 8) | buffer[2] as u16;
+
+        // Copy the payload out before anything else: `buffer` is handed to the
+        // transport to carry the 0x78, so nothing may still be borrowing it,
+        // and a record is small enough that a copy costs nothing.
+        let mut data = [0u8; ATTRIBUTE_RECORD];
+        let data_len = core::cmp::min(len, buffer.len()) - 3;
+        if data_len > ATTRIBUTE_RECORD {
+            return self.send_negative(
+                buffer,
+                SID_WRITE_DATA_BY_IDENTIFIER,
+                NRC_INCORRECT_LENGTH,
+            );
+        }
+        data[..data_len].copy_from_slice(&buffer[3..3 + data_len]);
+        let data = &data[..data_len];
+
+        // Work out what to write and where, but do not touch flash yet: the
+        // rewrite is long enough to need a 0x78 first.
+        let (address, patch_len) = match did {
+            DID_KERNEL_START_ADDRESS => {
+                if data.len() != 4 {
+                    return self.send_negative(
+                        buffer,
+                        SID_WRITE_DATA_BY_IDENTIFIER,
+                        NRC_INCORRECT_LENGTH,
+                    );
+                }
+                // On the wire big-endian, like every other UDS address; in the
+                // flags little-endian, because that is what the bootloader's
+                // own entry path and `tockloader` both read.
+                let address = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                if address < self.write_floor || address >= self.flash_end {
+                    return self.send_negative(
+                        buffer,
+                        SID_WRITE_DATA_BY_IDENTIFIER,
+                        NRC_REQUEST_OUT_OF_RANGE,
+                    );
+                }
+                let mut patch = [0u8; ATTRIBUTE_RECORD];
+                patch[..4].copy_from_slice(&address.to_le_bytes());
+                self.patch.set(patch);
+                (
+                    self.flags_address as usize + FLAGS_START_ADDRESS_OFFSET,
+                    4,
+                )
+            }
+            DID_ATTRIBUTE_BASE..=DID_ATTRIBUTE_LAST => {
+                // A short request writes a short record; the rest is zeroed, so
+                // a value can be cleared as well as set.
+                let mut patch = [0u8; ATTRIBUTE_RECORD];
+                patch[..data.len()].copy_from_slice(data);
+                self.patch.set(patch);
+                let index = (did - DID_ATTRIBUTE_BASE) as usize;
+                (
+                    self.attributes_address as usize + index * ATTRIBUTE_RECORD,
+                    ATTRIBUTE_RECORD,
+                )
+            }
+            // Fixed by the build, so there is nowhere to put a new value. The
+            // writable equivalent is the `appaddr` attribute.
+            DID_APPLICATION_START_ADDRESS
+            | DID_BOOT_SOFTWARE_IDENTIFICATION
+            | DID_ACTIVE_SESSION => {
+                return self.send_negative(
+                    buffer,
+                    SID_WRITE_DATA_BY_IDENTIFIER,
+                    NRC_CONDITIONS_NOT_CORRECT,
+                )
+            }
+            _ => {
+                return self.send_negative(
+                    buffer,
+                    SID_WRITE_DATA_BY_IDENTIFIER,
+                    NRC_REQUEST_OUT_OF_RANGE,
+                )
+            }
+        };
+
+        match self.stage_block(address, patch_len) {
+            Stage::Ready => {}
+            // Refused rather than attempted: writing this block would erase the
+            // code performing the write. `conditionsNotCorrect` is the honest
+            // answer -- the identifier is real and the request well formed, the
+            // board just cannot carry it out from where it is running.
+            Stage::WouldEraseSelf => {
+                return self.send_negative(
+                    buffer,
+                    SID_WRITE_DATA_BY_IDENTIFIER,
+                    NRC_CONDITIONS_NOT_CORRECT,
+                )
+            }
+            Stage::Unusable => {
+                return self.send_negative(
+                    buffer,
+                    SID_WRITE_DATA_BY_IDENTIFIER,
+                    NRC_GENERAL_PROGRAMMING_FAILURE,
+                )
+            }
+        }
+        self.pending_did.set(did);
+        self.job.set(Job::StageRead {
+            page: 0,
+            end: BLOCK_PAGES,
+        });
+        self.send_pending(buffer, SID_WRITE_DATA_BY_IDENTIFIER);
+    }
+
+    /// Set up a staged rewrite of the erase block holding `address`.
+    ///
+    /// Returns whether the request is one this can actually carry out; the work
+    /// itself starts once the 0x78 is on the wire.
+    fn stage_block(&self, address: usize, patch_len: usize) -> Stage {
+        let page_size = self.page_size();
+        let first_page = (address / page_size) & !(BLOCK_PAGES - 1);
+        let block_start = first_page * page_size;
+
+        if self.block_is_self(block_start) {
+            return Stage::WouldEraseSelf;
+        }
+        // The patch has to land inside the block being staged. It always does
+        // for the two DIDs above, but a mistake here would write the patch into
+        // whatever the offset happened to reach, so it is checked rather than
+        // assumed.
+        if address < block_start || address + patch_len > block_start + BLOCK_PAGES * page_size {
+            return Stage::Unusable;
+        }
+        if self.stage.map_or(true, |s| s.len() < BLOCK_PAGES * page_size) {
+            return Stage::Unusable;
+        }
+
+        self.stage_first_page.set(first_page);
+        self.patch_offset.set(address - block_start);
+        self.patch_len.set(patch_len);
+        Stage::Ready
     }
 
     fn tester_present(&self, buffer: &'static mut [u8], len: usize) {
@@ -841,7 +1164,7 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
     /// back from transmitting it.
     fn resume_job(&self, buffer: &'static mut [u8]) {
         match self.job.get() {
-            Job::Erase { .. } | Job::Crc { .. } => {
+            Job::Erase { .. } | Job::Crc { .. } | Job::StageRead { .. } => {
                 self.buffer.replace(buffer);
                 self.step();
             }
@@ -923,6 +1246,88 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
                         }
                     }
                 }
+                Job::StageRead { page, end } => {
+                    if page >= end {
+                        // The block is in RAM; patch it and start putting it
+                        // back. Nothing has been erased yet, so a failure up to
+                        // this point costs nothing.
+                        self.apply_patch();
+                        self.job.set(Job::StageWrite { page: 0, end });
+                        continue;
+                    }
+                    // Advance first, so the completion knows the page it just
+                    // read was `page - 1`, as the erase job does.
+                    self.job.set(Job::StageRead {
+                        page: page + 1,
+                        end,
+                    });
+                    let first = self.stage_first_page.get();
+                    match self.page_buffer.take() {
+                        Some(pb) => {
+                            if let Err((_e, pb)) = self.flash.read_page(first + page, pb) {
+                                self.page_buffer.replace(pb);
+                                self.job.set(Job::None);
+                                self.stepping.set(false);
+                                return self.fail_did_write();
+                            }
+                        }
+                        None => {
+                            self.job.set(Job::None);
+                            self.stepping.set(false);
+                            return self.fail_did_write();
+                        }
+                    }
+                }
+                Job::StageWrite { page, end } => {
+                    if page >= end {
+                        self.job.set(Job::None);
+                        self.stepping.set(false);
+                        return self.finish_did_write();
+                    }
+                    self.job.set(Job::StageWrite {
+                        page: page + 1,
+                        end,
+                    });
+                    let first = self.stage_first_page.get();
+                    let page_size = self.page_size();
+                    // Fill the page buffer from the staging copy. Ascending
+                    // order matters: the first write finds the block dirty and
+                    // erases it, and every later one finds it clean.
+                    let filled = match self.page_buffer.take() {
+                        Some(pb) => {
+                            let ok = self.stage.map_or(false, |s| {
+                                let from = page * page_size;
+                                if from + page_size > s.len() {
+                                    return false;
+                                }
+                                pb.as_mut().copy_from_slice(&s[from..from + page_size]);
+                                true
+                            });
+                            if !ok {
+                                self.page_buffer.replace(pb);
+                                None
+                            } else {
+                                Some(pb)
+                            }
+                        }
+                        None => None,
+                    };
+                    match filled {
+                        Some(pb) => {
+                            if let Err((_e, pb)) = self.flash.write_page(first + page, pb) {
+                                self.page_buffer.replace(pb);
+                                self.job.set(Job::None);
+                                self.stepping.set(false);
+                                return self.fail_did_write();
+                            }
+                        }
+                        None => {
+                            self.job.set(Job::None);
+                            self.stepping.set(false);
+                            return self.fail_did_write();
+                        }
+                    }
+                }
                 _ => break,
             }
 
@@ -949,6 +1354,49 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> UdsServer<'a, T, F> {
                 }
                 None => self.send(buffer, 4),
             }
+        }
+    }
+
+    /// Overwrite the staged block with the bytes the tester asked for.
+    ///
+    /// Bounds were settled in `stage_block`; this cannot silently write short
+    /// because a mismatch there refuses the request before any flash is
+    /// touched.
+    fn apply_patch(&self) {
+        let offset = self.patch_offset.get();
+        let len = self.patch_len.get();
+        let patch = self.patch.get();
+        self.stage.map(|s| {
+            if offset + len <= s.len() {
+                s[offset..offset + len].copy_from_slice(&patch[..len]);
+            }
+        });
+    }
+
+    fn finish_did_write(&self) {
+        if let Some(buffer) = self.buffer.take() {
+            let did = self.pending_did.get();
+            buffer[0] = SID_WRITE_DATA_BY_IDENTIFIER + POSITIVE_RESPONSE_OFFSET;
+            buffer[1] = (did >> 8) as u8;
+            buffer[2] = did as u8;
+            self.send(buffer, 3);
+        }
+    }
+
+    /// Report a failed staged rewrite.
+    ///
+    /// If this happens partway through `StageWrite` the block is left
+    /// incomplete, and on the SAMV71 that block holds the vector table -- the
+    /// board will need a debugger. There is nothing this can do about that
+    /// beyond saying so; the window exists because the attribute table shares
+    /// an erase block with the bootloader, which is a layout fact.
+    fn fail_did_write(&self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.send_negative(
+                buffer,
+                SID_WRITE_DATA_BY_IDENTIFIER,
+                NRC_GENERAL_PROGRAMMING_FAILURE,
+            );
         }
     }
 
@@ -1019,6 +1467,59 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> hil::flash::Client<F>
                 crc: new_crc,
             });
             self.step();
+        } else if let Job::StageRead { page, .. } = self.job.get() {
+            // `step` advanced the counter before issuing the read, so the page
+            // that just arrived is the one before it.
+            let page_size = pagebuffer.as_mut().len();
+            let done = page.saturating_sub(1);
+            let ok = self.stage.map_or(false, |s| {
+                let to = done * page_size;
+                if to + page_size > s.len() {
+                    return false;
+                }
+                s[to..to + page_size].copy_from_slice(pagebuffer.as_mut());
+                true
+            });
+            self.page_buffer.replace(pagebuffer);
+            if !ok {
+                self.job.set(Job::None);
+                return self.fail_did_write();
+            }
+            self.step();
+        } else if self.job.get() == Job::DidRead {
+            let page_size = pagebuffer.as_mut().len();
+            let offset = self.did_address.get() as usize % page_size;
+            let did = self.pending_did.get();
+            let len = self.did_len.get();
+            let reverse = self.did_reverse.get();
+
+            let copied = self.buffer.map_or(false, |buffer| {
+                if offset + len > page_size || buffer.len() < 3 + len {
+                    return false;
+                }
+                buffer[0] = SID_READ_DATA_BY_IDENTIFIER + POSITIVE_RESPONSE_OFFSET;
+                buffer[1] = (did >> 8) as u8;
+                buffer[2] = did as u8;
+                buffer[3..3 + len].copy_from_slice(&pagebuffer.as_mut()[offset..offset + len]);
+                if reverse {
+                    buffer[3..3 + len].reverse();
+                }
+                true
+            });
+            self.page_buffer.replace(pagebuffer);
+            self.job.set(Job::None);
+
+            if let Some(buffer) = self.buffer.take() {
+                if copied {
+                    self.send(buffer, 3 + len);
+                } else {
+                    self.send_negative(
+                        buffer,
+                        SID_READ_DATA_BY_IDENTIFIER,
+                        NRC_GENERAL_PROGRAMMING_FAILURE,
+                    );
+                }
+            }
         } else if self.job.get() == Job::Read {
             let page_size = pagebuffer.as_mut().len();
             let address = self.prev_block_address.get();
@@ -1068,6 +1569,16 @@ impl<'a, T: BootloaderTransport<'a>, F: hil::flash::Flash> hil::flash::Client<F>
         result: Result<(), hil::flash::Error>,
     ) {
         self.page_buffer.replace(pagebuffer);
+
+        if let Job::StageWrite { .. } = self.job.get() {
+            if result.is_err() {
+                self.job.set(Job::None);
+                return self.fail_did_write();
+            }
+            // `step` already advanced the page counter; drive it onwards.
+            return self.step();
+        }
+
         if self.job.get() != Job::Write {
             return;
         }

@@ -96,6 +96,14 @@ static mut PROCESSES: [ProcessSlot; NUM_PROCS] = [];
 
 static mut CHIP: Option<&'static Atsamv71q21b<Atsamv71q21bDefaultPeripherals>> = None;
 
+// Placed by the linker script; the UDS server reaches the attribute table and
+// the flags through these rather than through hard-coded addresses.
+extern "C" {
+    static _flags_address: u8;
+    static _attributes_address: u8;
+    static _etext: u8;
+}
+
 /// Reserve stack space (8 KB).
 #[no_mangle]
 #[link_section = ".stack_buffer"]
@@ -663,6 +671,10 @@ pub unsafe fn main() {
         bootloader::flash_large_to_small::FiveTwelvePage::default()
     );
     let uds_buf = static_init!([u8; 600], [0; 600]);
+    // One flash erase block of staging for attribute and start-address writes.
+    // The table shares its block with the vector table, so the block is rewritten
+    // whole rather than a page at a time; see `uds::BLOCK_PAGES`.
+    let uds_stage = static_init!([u8; 8192], [0; 8192]);
 
     let uds = static_init!(
         bootloader::uds::UdsServer<
@@ -683,6 +695,7 @@ pub unsafe fn main() {
             &bootloader_exit,
             uds_page_buf,
             uds_buf,
+            uds_stage,
             0x0007_0000, // application region start, reported by DID 0xF200
             // Lowest writable address: the end of the bootloader's own region,
             // so the kernel is reachable over CAN. A development-tool
@@ -691,6 +704,16 @@ pub unsafe fn main() {
             // variant does instead.
             0x0001_0000,
             0x0020_0000, // end of the 2 MB flash alias
+            // The attribute table and the flags. Both sit below the write floor
+            // and so are reachable only through their DIDs, never by address.
+            unsafe { (&_attributes_address as *const u8) as u32 },
+            unsafe { (&_flags_address as *const u8) as u32 },
+            // End of the running bootloader. On this layout the attribute table
+            // shares an erase block with the vector table and the first pages of
+            // .text, so writes to it are refused: erasing that block deletes the
+            // code doing the erasing. Moving the table above this line is what
+            // would turn attribute writes on.
+            unsafe { (&_etext as *const u8) as u32 },
         )
     );
 
