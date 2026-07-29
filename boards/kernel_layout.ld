@@ -89,6 +89,21 @@ SECTIONS
         . = _attribute_table_start + 3072;
     } > rom
 
+    /* Tock kernel attribute TLVs.
+     *
+     * Placed explicitly, not because the address matters but because leaving it
+     * an orphan means the linker picks the address by heuristic -- and that
+     * heuristic follows whatever section happens to precede it. Adding a
+     * section elsewhere in this file moved it out of flash entirely and landed
+     * it on top of the SAMV71 bootloader's double-reset scratch word at
+     * 0x2045FFF0. Nothing wrote it, so nothing broke, but an image is not
+     * supposed to depend on orphan-placement luck. Measured 2026-07-28.
+     */
+    .tock_attributes :
+    {
+        KEEP(*(.tock.attr .tock.attr.*))
+    } > rom
+
     .text :
     {
         /* .text and .rodata hold most program code and immutable constants */

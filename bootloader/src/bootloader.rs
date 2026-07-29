@@ -31,6 +31,21 @@ extern "C" {
 // Bootloader constants
 const ESCAPE_CHAR: u8 = 0xFC;
 
+/// One attribute record: 8-byte key, 1-byte length, 55 bytes of value.
+const ATTRIBUTE_RECORD: usize = 64;
+
+/// Pages in one flash erase block.
+///
+/// `write_page` erases a whole block before writing a page that is not already
+/// blank, so a single-page read-modify-write of the attribute table erases the
+/// block and puts back exactly one page of it. Writes here therefore stage the
+/// entire block, patch it, and write it back in ascending page order: the first
+/// write triggers the one erase and the rest find the block already clean.
+///
+/// Sixteen matches the SAMV71 EFC. A part that erases in smaller units simply
+/// stages more than it needs to, which is harmless.
+const BLOCK_PAGES: usize = 16;
+
 const RES_PONG: u8 = 0x11;
 const RES_BADADDR: u8 = 0x12;
 const RES_INTERNAL_ERROR: u8 = 0x13;
@@ -50,11 +65,16 @@ enum State {
     GetAttribute {
         index: u8,
     },
-    SetAttribute {
-        index: u8,
+    /// Copying the erase block holding the attribute table into `stage`,
+    /// `page` of `end`, before patching it. See `BLOCK_PAGES`.
+    StageRead {
+        page: usize,
+        end: usize,
     },
-    SetStartAddress {
-        address: u32,
+    /// Writing the patched block back, `page` of `end`.
+    StageWrite {
+        page: usize,
+        end: usize,
     },
     WriteFlashPage,
     ReadRange {
@@ -180,7 +200,22 @@ pub struct Bootloader<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash 
     reset_function: &'a (dyn Fn() + 'a),
     page_buffer: TakeCell<'static, F::Page>,
     buffer: TakeCell<'static, [u8]>,
+    /// One erase block of RAM, used only while rewriting the attribute table or
+    /// the flags. Absent means those writes are refused rather than attempted.
+    stage: TakeCell<'static, [u8]>,
     state: Cell<State>,
+    /// The bytes a staged rewrite will patch in, where in the staged block they
+    /// go, and which flash page the block starts at. Held here because the
+    /// message buffer is needed for the response.
+    patch: Cell<[u8; ATTRIBUTE_RECORD]>,
+    patch_len: Cell<usize>,
+    patch_offset: Cell<usize>,
+    stage_first_page: Cell<usize>,
+    /// Guards against recursing once per page: the flash driver may complete
+    /// inside the call, so the completion flags that the loop should go round
+    /// again rather than starting a nested one. Same reason as `uds.rs`.
+    stepping: Cell<bool>,
+    step_again: Cell<bool>,
     flags_address: usize,
     attributes_address: usize,
     /// First address the bootloader will let a client write or erase.
@@ -191,11 +226,13 @@ pub struct Bootloader<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash 
     /// whole region rather than just `_stext.._etext`, and that matters more
     /// than it looks:
     ///
-    /// * The flags and attributes sit *below* `_stext`, so a bound starting
-    ///   there leaves them writable, and a write to the attribute table
-    ///   block-erases the bootloader out from under itself (see the SAMV71
-    ///   EFC's `write_page`, which erases a 16-page block when the target page
-    ///   is dirty).
+    /// * On the default layout the flags and attributes sit *below* `_stext`,
+    ///   so a bound starting there leaves them writable by raw address, and a
+    ///   raw write into the attribute table block-erases the bootloader out
+    ///   from under itself (see the SAMV71 EFC's `write_page`, which erases a
+    ///   16-page block when the target page is dirty). Attribute writes go
+    ///   through `SetAttr`, which stages the block; this bound is what stops
+    ///   anyone reaching the same flash by address instead.
     /// * Erase granularity is coarser than a page. Erasing a page just above
     ///   the bootloader's last byte can still take out the block containing
     ///   its last byte, so the bound has to sit on a region boundary, not on
@@ -221,6 +258,7 @@ impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> Bootloader<
             protected_end,
             unsafe { (&_flags_address as *const u8) as usize },
             unsafe { (&_attributes_address as *const u8) as usize },
+            None,
         )
     }
 
@@ -240,6 +278,7 @@ impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> Bootloader<
         protected_end: u32,
         flags_address: usize,
         attributes_address: usize,
+        stage: Option<&'static mut [u8]>,
     ) -> Bootloader<'a, T, F> {
         Bootloader {
             transport: transport,
@@ -247,11 +286,173 @@ impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> Bootloader<
             reset_function: reset_function,
             page_buffer: TakeCell::new(page_buffer),
             buffer: TakeCell::new(buffer),
+            stage: match stage {
+                Some(s) => TakeCell::new(s),
+                None => TakeCell::empty(),
+            },
             state: Cell::new(State::Idle),
+            patch: Cell::new([0; ATTRIBUTE_RECORD]),
+            patch_len: Cell::new(0),
+            patch_offset: Cell::new(0),
+            stage_first_page: Cell::new(0),
+            stepping: Cell::new(false),
+            step_again: Cell::new(false),
             flags_address,
             attributes_address,
             protected_end,
         }
+    }
+
+    /// Begin rewriting the erase block that holds `address`.
+    ///
+    /// The patch itself is already in `self.patch`; this works out which block
+    /// to stage and starts reading it. A refusal here answers the client rather
+    /// than touching flash, which matters because the alternative -- writing
+    /// the page directly -- erases the surrounding block and restores one page
+    /// of it.
+    fn begin_staged_write(&self, address: usize, patch_len: usize) {
+        let page_size = self.page_buffer.map_or(512, |page| page.as_mut().len());
+        let first_page = (address / page_size) & !(BLOCK_PAGES - 1);
+        let block_start = first_page * page_size;
+        let block_len = BLOCK_PAGES * page_size;
+
+        // Refuse rather than half-do it: without staging there is no way to put
+        // back the rest of the block, and a board that erases its own attribute
+        // table and 15 neighbouring pages is worse off than one that said no.
+        let ok = self.stage.map_or(false, |s| s.len() >= block_len)
+            && address >= block_start
+            && address + patch_len <= block_start + block_len;
+        if !ok {
+            self.state.set(State::Idle);
+            return self.send_response(RES_INTERNAL_ERROR);
+        }
+
+        self.stage_first_page.set(first_page);
+        self.patch_offset.set(address - block_start);
+        self.patch_len.set(patch_len);
+        self.state.set(State::StageRead {
+            page: 0,
+            end: BLOCK_PAGES,
+        });
+        self.step();
+    }
+
+    /// Drive a staged rewrite forward.
+    ///
+    /// Iterative rather than recursive: the SAMV71 flash driver completes
+    /// inside the call, so chaining "issue the next page from the completion"
+    /// would nest a stack frame per page. `stepping` says a loop is already
+    /// running and the completion only has to ask for another turn.
+    fn step(&self) {
+        if self.stepping.get() {
+            self.step_again.set(true);
+            return;
+        }
+        self.stepping.set(true);
+
+        loop {
+            self.step_again.set(false);
+
+            match self.state.get() {
+                State::StageRead { page, end } => {
+                    if page >= end {
+                        // The block is in RAM. Patch it and start putting it
+                        // back; nothing has been erased yet, so a failure up to
+                        // here has cost nothing.
+                        self.apply_patch();
+                        self.state.set(State::StageWrite { page: 0, end });
+                        continue;
+                    }
+                    // Advance first, so the completion knows the page that just
+                    // arrived was `page`.
+                    self.state.set(State::StageRead { page: page + 1, end });
+                    let first = self.stage_first_page.get();
+                    match self.page_buffer.take() {
+                        Some(pb) => {
+                            if let Err((_e, pb)) = self.flash.read_page(first + page, pb) {
+                                self.page_buffer.replace(pb);
+                                self.stepping.set(false);
+                                self.state.set(State::Idle);
+                                return self.send_response(RES_INTERNAL_ERROR);
+                            }
+                        }
+                        None => {
+                            self.stepping.set(false);
+                            self.state.set(State::Idle);
+                            return self.send_response(RES_INTERNAL_ERROR);
+                        }
+                    }
+                }
+                State::StageWrite { page, end } => {
+                    if page >= end {
+                        self.stepping.set(false);
+                        self.state.set(State::Idle);
+                        return self.send_response(RES_OK);
+                    }
+                    self.state.set(State::StageWrite { page: page + 1, end });
+                    let first = self.stage_first_page.get();
+                    let page_size = self.page_buffer.map_or(512, |p| p.as_mut().len());
+                    // Ascending order matters: the first write finds the block
+                    // dirty and erases it, and every later one finds it clean.
+                    let filled = match self.page_buffer.take() {
+                        Some(pb) => {
+                            let ok = self.stage.map_or(false, |s| {
+                                let from = page * page_size;
+                                if from + page_size > s.len() {
+                                    return false;
+                                }
+                                pb.as_mut().copy_from_slice(&s[from..from + page_size]);
+                                true
+                            });
+                            if ok {
+                                Some(pb)
+                            } else {
+                                self.page_buffer.replace(pb);
+                                None
+                            }
+                        }
+                        None => None,
+                    };
+                    match filled {
+                        Some(pb) => {
+                            if let Err((_e, pb)) = self.flash.write_page(first + page, pb) {
+                                self.page_buffer.replace(pb);
+                                self.stepping.set(false);
+                                self.state.set(State::Idle);
+                                return self.send_response(RES_INTERNAL_ERROR);
+                            }
+                        }
+                        None => {
+                            self.stepping.set(false);
+                            self.state.set(State::Idle);
+                            return self.send_response(RES_INTERNAL_ERROR);
+                        }
+                    }
+                }
+                _ => break,
+            }
+
+            if !self.step_again.get() {
+                // The driver has not completed yet; its callback comes back
+                // into here.
+                break;
+            }
+        }
+
+        self.stepping.set(false);
+    }
+
+    /// Overwrite the staged block with the bytes the client asked for. Bounds
+    /// were settled in `begin_staged_write`.
+    fn apply_patch(&self) {
+        let offset = self.patch_offset.get();
+        let len = self.patch_len.get();
+        let patch = self.patch.get();
+        self.stage.map(|s| {
+            if offset + len <= s.len() {
+                s[offset..offset + len].copy_from_slice(&patch[..len]);
+            }
+        });
     }
 
     pub fn start(&self) {
@@ -446,36 +647,30 @@ impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> BootloaderT
                 }
                 Ok(Some(tock_bootloader_protocol::Command::SetAttr { index, key, value })) => {
                     let buffer = buf.take().unwrap();
-                    self.state.set(State::SetAttribute { index });
-                    for i in 0..8 {
-                        buffer[i] = key[i];
-                    }
-                    buffer[8] = value.len() as u8;
-                    for i in 0..55 {
-                        if i < value.len() {
-                            buffer[9 + i] = value[i];
-                        } else {
-                            buffer[9 + i] = 0;
-                        }
-                    }
+                    // Build the record now, while the command's borrowed slices
+                    // are still in scope, and keep it out of the message buffer
+                    // so that buffer is free for the response.
+                    let mut record = [0u8; ATTRIBUTE_RECORD];
+                    record[..8].copy_from_slice(&key[..8]);
+                    record[8] = value.len() as u8;
+                    let n = cmp::min(value.len(), ATTRIBUTE_RECORD - 9);
+                    record[9..9 + n].copy_from_slice(&value[..n]);
+                    self.patch.set(record);
+
+                    let address = self.attributes_address + (index as usize * ATTRIBUTE_RECORD);
                     self.buffer.replace(buffer);
-                    self.page_buffer.take().map(move |page| {
-                        let page_len = page.as_mut().len();
-                        let read_address = self.attributes_address + (index as usize * 64);
-                        let page_index = read_address / page_len;
-                        let _ = self.flash.read_page(page_index, page);
-                    });
+                    self.begin_staged_write(address, ATTRIBUTE_RECORD);
                     break;
                 }
                 Ok(Some(tock_bootloader_protocol::Command::SetStartAddress { address })) => {
                     let buffer = buf.take().unwrap();
-                    self.state.set(State::SetStartAddress { address });
+                    let mut record = [0u8; ATTRIBUTE_RECORD];
+                    record[..4].copy_from_slice(&address.to_le_bytes());
+                    self.patch.set(record);
+
+                    let at = self.flags_address + 32;
                     self.buffer.replace(buffer);
-                    self.page_buffer.take().map(move |page| {
-                        let page_len = page.as_mut().len();
-                        let page_index = self.flags_address / page_len;
-                        let _ = self.flash.read_page(page_index, page);
-                    });
+                    self.begin_staged_write(at, 4);
                     break;
                 }
                 Ok(Some(tock_bootloader_protocol::Command::Exit)) => {
@@ -617,38 +812,26 @@ impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> hil::flash:
                 });
             }
 
-            // We need to update the page we just read with the new attribute,
-            // and then write that all back to flash.
-            State::SetAttribute { index } => {
-                self.buffer.map(move |buffer| {
-                    let page_len = pagebuffer.as_mut().len();
-                    let read_address = self.attributes_address + (index as usize * 64);
-                    let page_offset = read_address % page_len;
-                    let page_index = read_address / page_len;
-
-                    // Copy the first 64 bytes of the buffer into the correct
-                    // spot in the page.
-                    for i in 0..64 {
-                        pagebuffer.as_mut()[page_offset + i] = buffer[i];
+            // One page of the erase block has arrived; copy it into the staging
+            // buffer. `step` advanced the counter before issuing the read, so
+            // the page that just arrived is the one before it.
+            State::StageRead { page, .. } => {
+                let page_size = pagebuffer.as_mut().len();
+                let done = page.saturating_sub(1);
+                let ok = self.stage.map_or(false, |s| {
+                    let to = done * page_size;
+                    if to + page_size > s.len() {
+                        return false;
                     }
-                    let _ = self.flash.write_page(page_index, pagebuffer);
+                    s[to..to + page_size].copy_from_slice(pagebuffer.as_mut());
+                    true
                 });
-            }
-
-            // We need to update the page we just read with the new attribute,
-            // and then write that all back to flash.
-            State::SetStartAddress { address } => {
-                let page_len = pagebuffer.as_mut().len();
-                let read_address = self.flags_address + 32;
-                let page_offset = read_address % page_len;
-                let page_index = read_address / page_len;
-
-                // Copy the first 64 bytes of the buffer into the correct
-                // spot in the page.
-                for (i, v) in address.to_le_bytes().iter().enumerate() {
-                    pagebuffer.as_mut()[page_offset + i] = *v;
+                self.page_buffer.replace(pagebuffer);
+                if !ok {
+                    self.state.set(State::Idle);
+                    return self.send_response(RES_INTERNAL_ERROR);
                 }
-                let _ = self.flash.write_page(page_index, pagebuffer);
+                self.step();
             }
 
             // Pass what we have read so far to the client.
@@ -787,24 +970,11 @@ impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> hil::flash:
                 });
             }
 
-            // Attribute writing done, send an OK response.
-            State::SetAttribute { index: _ } => {
-                self.state.set(State::Idle);
-                self.buffer.take().map(move |buffer| {
-                    buffer[0] = ESCAPE_CHAR;
-                    buffer[1] = RES_OK;
-                    let _ = self.transport.transmit_message(buffer, 2);
-                });
-            }
-
-            // Attribute writing done, send an OK response.
-            State::SetStartAddress { address: _ } => {
-                self.state.set(State::Idle);
-                self.buffer.take().map(move |buffer| {
-                    buffer[0] = ESCAPE_CHAR;
-                    buffer[1] = RES_OK;
-                    let _ = self.transport.transmit_message(buffer, 2);
-                });
+            // One page of the staged block is down; `step` already advanced the
+            // counter, so just drive it onwards. It sends the response once the
+            // whole block is back.
+            State::StageWrite { .. } => {
+                self.step();
             }
 
             _ => {

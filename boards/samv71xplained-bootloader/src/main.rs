@@ -507,6 +507,9 @@ pub unsafe fn main() {
         bootloader::flash_large_to_small::FiveTwelvePage,
         bootloader::flash_large_to_small::FiveTwelvePage::default()
     );
+    // One flash erase block of staging for the UART SetAttr/SetStartAddress
+    // path, which rewrites the whole block rather than one page of it.
+    let bl_stage = static_init!([u8; 8192], [0; 8192]);
 
     // -----------------------------------------------------------------------
     // CAN transport (ISO-TP over MCAN1)
@@ -683,6 +686,11 @@ pub unsafe fn main() {
             // so that it can be rewritten at runtime; see layout.ld.
             unsafe { (&_relocated_flags_address as *const u8) as usize },
             unsafe { (&_relocated_attributes_address as *const u8) as usize },
+            // Its own staging block. Separate from the UDS server's rather than
+            // shared, because the two servers are independent owners and a
+            // TakeCell can only be held by one of them -- sharing would turn a
+            // concurrent write into a silent refusal on whichever asked second.
+            Some(bl_stage),
         )
     );
 
