@@ -179,19 +179,42 @@ fn bootloader_exit() {
 
 /// How long the bootloader listens on CAN before jumping to the kernel.
 ///
-/// This is the escape hatch for a board whose applications cannot be reached.
-/// Handover into the bootloader normally goes through the `uds` application, so
-/// erasing it, replacing it with a broken one, or invalidating its signature
-/// all leave the board booting happily with nothing listening -- and, before
-/// this window existed, needing a debugger. Sections 20.3 and 21.3 of the
-/// design document are both instances of exactly that.
+/// **Zero disables the window entirely**, MCAN bring-up included, which is what
+/// a board with a `FLASH_EN` pin should use: the pin does the same job for the
+/// price of a register read instead of a third of a second on every boot.
 ///
-/// 300 ms is a compromise. It is long enough for a host that is already
-/// hammering the bus to land a frame inside it, and short enough not to be
-/// noticed on a board that boots in seconds. It is paid on *every* boot,
-/// including healthy ones, which is the price of the escape hatch being
-/// available when it is needed rather than when it was anticipated.
-const CAN_ENTRY_WINDOW_MS: u32 = 300;
+/// This board keeps a window because it has no `FLASH_EN` line wired, so the
+/// pin below always reads its pull-up and never asks to stay. 100 ms is ample
+/// against a host knocking every 10 ms -- roughly ten chances to land a frame
+/// -- and a third of the original cost.
+///
+/// The window and the pin are independent on purpose. The window needs the CAN
+/// subsystem to be working, which is precisely what may not be true; the pin
+/// does not care.
+const CAN_ENTRY_WINDOW_MS: u32 = 100;
+
+/// Whether this board has a `FLASH_EN` line, and which pin it is.
+///
+/// Production boards carry one on PE3: **normally high, pulled low to hold the
+/// board in the bootloader**. The polarity matters and is chosen so the failure
+/// modes are safe -- an unconnected or broken line floats to the internal
+/// pull-up, reads high, and the board boots. Only a deliberate ground holds it.
+///
+/// The converse is worth stating plainly: a harness fault that shorts this line
+/// to ground stops the ECU booting. That is the cost of having the escape hatch
+/// not depend on any working firmware.
+const FLASH_EN_PIN: Option<usize> = Some(3);
+
+/// SAMV71 peripheral ID for PIOE.
+const PIOE_PID: u32 = 17;
+
+/// How many of the three `FLASH_EN` samples must read low to count as asserted.
+///
+/// Three -- the line is active low. Exists as a constant only so the assert
+/// path can be exercised on a board where `FLASH_EN` is not wired: setting it
+/// to 0 makes the *unconnected, pulled-up* pin count as asserted, which drives
+/// every step of the check except the external signal itself. Leave it at 3.
+const FLASH_EN_ASSERTED_LOW_COUNT: u32 = 3;
 
 /// TC0 runs from the 32 kHz slow clock.
 const TC_TICKS_PER_SECOND: u32 = 32_768;
@@ -265,6 +288,44 @@ fn configure_mcan(mcan: &samv71q21b::mcan::Mcan) {
     });
 }
 
+/// Is the `FLASH_EN` line being held low?
+///
+/// Costs a clock enable, a pull-up settle and three register reads -- call it
+/// tens of microseconds against the CAN window's hundreds of milliseconds. That
+/// is the whole argument for preferring it where the hardware has the line.
+///
+/// Reads the pin three times and requires agreement. A line long enough to
+/// leave the board is long enough to pick up a transient, and the consequence
+/// of a false read in either direction is bad: a spurious low strands a healthy
+/// board in the bootloader, and a spurious high ignores an operator who is
+/// standing there asking for it.
+fn flash_en_asserted(port: &samv71q21b::gpio::PortE<'static>, pin_index: usize) -> bool {
+    use kernel::hil::gpio::{Configure, FloatingState, Input};
+
+    let pin = port.pin(pin_index);
+    pin.make_input();
+    // The pull-up is the safety net, not the signal: an unconnected line must
+    // read high and let the board boot.
+    pin.set_floating_state(FloatingState::PullUp);
+
+    // Let the pull-up charge whatever capacitance the line has before trusting
+    // the first sample.
+    for _ in 0..10_000 {
+        cortexm7::support::nop();
+    }
+
+    let mut low = 0;
+    for _ in 0..3 {
+        if !pin.read() {
+            low += 1;
+        }
+        for _ in 0..1_000 {
+            cortexm7::support::nop();
+        }
+    }
+    low == FLASH_EN_ASSERTED_LOW_COUNT
+}
+
 /// Listen on CAN for `CAN_ENTRY_WINDOW_MS`; return whether anyone knocked.
 ///
 /// Polled rather than interrupt-driven on purpose: this runs before
@@ -282,6 +343,10 @@ fn can_entry_requested(
     tc: &samv71q21b::tc::Tc<'static>,
 ) -> bool {
     use kernel::hil::time::{Counter, Ticks, Time};
+
+    if CAN_ENTRY_WINDOW_MS == 0 {
+        return false;
+    }
 
     configure_mcan(mcan);
     if mcan.hw_enable_blocking().is_err() {
@@ -506,6 +571,9 @@ pub unsafe fn main() {
     pmc::PMC.enable_peripheral_clock(10); // PIOA — PA21 USART1 RXD
     pmc::PMC.enable_peripheral_clock(11); // PIOB — PB4  USART1 TXD
     pmc::PMC.enable_peripheral_clock(12); // PIOC — PC9 LED1, PC12/PC14 MCAN1
+    // PIOE — PE3 FLASH_EN. The PIO controller needs its clock to synchronise
+    // the input before PDSR reflects the pin.
+    pmc::PMC.enable_peripheral_clock(PIOE_PID);
 
     // MCAN1: peripheral clock + PCK5 as the CAN core clock. The SAMV71 MCAN
     // takes its core clock from PCK5, not from a GCLK via PMC_PCR -- the
@@ -613,8 +681,18 @@ pub unsafe fn main() {
         | bootloader::kernel_integrity::Verdict::NoDescriptor => {}
     }
 
-    // Listen briefly for someone asking to stay, before deciding to jump.
-    if can_entry_requested(&peripherals.mcan1, &peripherals.tc0) {
+    // Two ways to ask the bootloader to stay, checked cheapest first.
+    //
+    // The FLASH_EN pin is a register read; the CAN window costs real time on
+    // every boot. A board with the pin wired sets CAN_ENTRY_WINDOW_MS to 0 and
+    // pays neither. Both end in the same GPBR7 magic, so there is still one way
+    // to say "stay resident" and the entry check clears it as usual.
+    let asked_to_stay = match FLASH_EN_PIN {
+        Some(index) => flash_en_asserted(&peripherals.pe, index),
+        None => false,
+    } || can_entry_requested(&peripherals.mcan1, &peripherals.tc0);
+
+    if asked_to_stay {
         gpbr.set(samv71q21b::gpbr::GpbrIndex::Gpbr7, 0x90);
     }
 
