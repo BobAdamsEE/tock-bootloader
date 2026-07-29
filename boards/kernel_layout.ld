@@ -243,4 +243,41 @@ SECTIONS
         . = ALIGN(4);
         _ezero = .;
     } > ram
+
+
+    /* Attribute table, relocated out of the image's own erase block.
+     *
+     * Opt-in, and off unless a board defines ATTRIBUTE_TABLE_ADDR. Boards that
+     * do not define it are completely unaffected: no input section matches, no
+     * space is reserved, and the table stays at 0x400/0x600 as before.
+     *
+     * Why a board would want this. Erasing flash takes a whole block with it --
+     * 8 KB on the SAMV71 -- so a table the running image has to *rewrite* cannot
+     * share a block with that image's code. The default position at 0x400 does
+     * share one: erasing it deletes the code performing the erase, which on the
+     * SAMV71 leaves a board that needs a debugger. A board that wants its
+     * attributes writable at runtime therefore puts them somewhere with nothing
+     * else in the block, and uses .flags_relocated / .attributes_relocated
+     * instead of .flags / .attributes.
+     *
+     * Placed after .relocate on purpose. `_etext` marks where the initialised
+     * data image starts, and Tock copies from there at boot, so nothing may be
+     * inserted between the two -- this section goes after both and takes an
+     * absolute address of its own.
+     */
+    .attribute_relocated (DEFINED(ATTRIBUTE_TABLE_ADDR) ? ATTRIBUTE_TABLE_ADDR : .) :
+    {
+        _relocated_table_start = .;
+        _relocated_flags_address = .;
+        KEEP(*(.flags_relocated))
+        FILL(0x0)
+        /* Attributes start on the page after the flags, as at 0x400/0x600. */
+        . = DEFINED(ATTRIBUTE_TABLE_ADDR) ? _relocated_table_start + 512 : .;
+        _relocated_attributes_address = .;
+        KEEP(*(.attributes_relocated))
+        FILL(0x0)
+        /* Room for all 16 records, so an unwritten slot reads as zeroes rather
+           than as whatever follows. */
+        . = DEFINED(ATTRIBUTE_TABLE_ADDR) ? _relocated_table_start + 1536 : .;
+    } > rom
 }

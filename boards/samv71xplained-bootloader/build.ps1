@@ -60,9 +60,20 @@ try {
     #   --strip-sections   keep the image from ballooning when SRAM is below flash
     #   --strip-all        drop non-allocated sections outside segments
     #   --remove-section .apps   .apps is an ELF-only placeholder for appended apps
+    #
+    # .tock.attr.kernel_version is loadable but lives at 0x2045FFF0, in SRAM. It
+    # used to fall off the end of the image harmlessly; once the attribute table
+    # moved to 0xE000 it stopped being the highest segment, and objcopy padded
+    # the binary out to SRAM -- a 541 MB .bin. Dropping it explicitly is what
+    # keeps the image to the flash span, and it was never in the .bin anyway.
+    #
+    # --gap-fill 0xFF so the reserve between the code and the attribute table
+    # reads as unprogrammed flash rather than as zeros.
     $prevHash = if (Test-Path $Bin) { (Get-FileHash $Bin -Algorithm SHA256).Hash } else { $null }
 
-    & $objcopy --output-target=binary --strip-sections --strip-all --remove-section .apps $Elf $Bin
+    & $objcopy --output-target=binary --strip-sections --strip-all `
+               --remove-section .apps --remove-section .tock.attr.kernel_version `
+               --gap-fill 0xFF $Elf $Bin
     if ($LASTEXITCODE -ne 0) { throw "llvm-objcopy failed (exit $LASTEXITCODE)" }
 
     # ---- 4. Report ----------------------------------------------------------

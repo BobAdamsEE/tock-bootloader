@@ -92,11 +92,35 @@ impl<'a> BootloaderEnterer<'a> {
         active_notifier: &'a mut dyn interfaces::ActiveNotifier,
         kernel_region_start: u32,
     ) -> BootloaderEnterer<'a> {
+        Self::new_with_flags(
+            entry_decider,
+            jumper,
+            active_notifier,
+            kernel_region_start,
+            unsafe { (&_flags_address as *const u8) as u32 },
+        )
+    }
+
+    /// Same, for a board that has moved its flags.
+    ///
+    /// This is the one that decides where to jump, so a board that relocates
+    /// its flags and forgets to say so here does not get a wrong kernel -- it
+    /// gets no kernel at all. The start address reads back as zero, falls below
+    /// `kernel_region_start`, and the board sits in the bootloader looking
+    /// perfectly healthy. Measured 2026-07-28, and the reason this constructor
+    /// exists rather than a second `extern` symbol.
+    pub fn new_with_flags(
+        entry_decider: &'a dyn interfaces::BootloaderEntry,
+        jumper: &'a dyn interfaces::Jumper,
+        active_notifier: &'a mut dyn interfaces::ActiveNotifier,
+        kernel_region_start: u32,
+        flags_address: u32,
+    ) -> BootloaderEnterer<'a> {
         BootloaderEnterer {
             entry_decider,
             jumper,
             active_notifier,
-            bootloader_flags_address: unsafe { (&_flags_address as *const u8) as u32 },
+            bootloader_flags_address: flags_address,
             kernel_region_start,
         }
     }
@@ -188,6 +212,35 @@ impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> Bootloader<
         buffer: &'static mut [u8],
         protected_end: u32,
     ) -> Bootloader<'a, T, F> {
+        Self::new_with_table(
+            transport,
+            flash,
+            reset_function,
+            page_buffer,
+            buffer,
+            protected_end,
+            unsafe { (&_flags_address as *const u8) as usize },
+            unsafe { (&_attributes_address as *const u8) as usize },
+        )
+    }
+
+    /// Same, for a board that has moved its attribute table.
+    ///
+    /// The default position sits inside the erase block holding the vector
+    /// table and the start of the bootloader's code, which makes the table
+    /// unwritable at runtime on parts that erase in blocks. A board that moves
+    /// it has to tell both servers where it went, and this is how the UART one
+    /// is told.
+    pub fn new_with_table(
+        transport: &'a T,
+        flash: &'a F,
+        reset_function: &'a (dyn Fn() + 'a),
+        page_buffer: &'static mut F::Page,
+        buffer: &'static mut [u8],
+        protected_end: u32,
+        flags_address: usize,
+        attributes_address: usize,
+    ) -> Bootloader<'a, T, F> {
         Bootloader {
             transport: transport,
             flash: flash,
@@ -195,8 +248,8 @@ impl<'a, T: BootloaderTransport<'a> + 'a, F: hil::flash::Flash + 'a> Bootloader<
             page_buffer: TakeCell::new(page_buffer),
             buffer: TakeCell::new(buffer),
             state: Cell::new(State::Idle),
-            flags_address: unsafe { (&_flags_address as *const u8) as usize },
-            attributes_address: unsafe { (&_attributes_address as *const u8) as usize },
+            flags_address,
+            attributes_address,
             protected_end,
         }
     }

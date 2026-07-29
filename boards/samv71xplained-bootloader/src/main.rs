@@ -96,11 +96,16 @@ static mut PROCESSES: [ProcessSlot; NUM_PROCS] = [];
 
 static mut CHIP: Option<&'static Atsamv71q21b<Atsamv71q21bDefaultPeripherals>> = None;
 
-// Placed by the linker script; the UDS server reaches the attribute table and
-// the flags through these rather than through hard-coded addresses.
+// Placed by the linker script. Both servers reach the attribute table and the
+// flags through these rather than through hard-coded addresses, which is what
+// lets the table move without touching either of them.
+//
+// `_relocated_*` rather than the conventional `_flags_address` /
+// `_attributes_address`: this board puts the table in its own erase block at
+// 0xE000 so that it can be rewritten at runtime. See layout.ld.
 extern "C" {
-    static _flags_address: u8;
-    static _attributes_address: u8;
+    static _relocated_flags_address: u8;
+    static _relocated_attributes_address: u8;
     static _etext: u8;
 }
 
@@ -109,11 +114,15 @@ extern "C" {
 #[link_section = ".stack_buffer"]
 pub static mut STACK_MEMORY: [u8; 0x4000] = [0; 0x4000];
 
-/// Bootloader flags at _flags_address (0x400).
+/// Bootloader flags at _relocated_flags_address (0xE000).
 /// - Offset 14: version string (up to 8 bytes, null-terminated)
 /// - Offset 32: kernel start address (4 bytes, little-endian)
+///
+/// The start address here is what `tockloader` reads and writes. This board
+/// does *not* boot from it -- it jumps to `KERNEL_START`, a constant -- so
+/// changing it changes what a tester reads back, not what runs.
 #[used]
-#[link_section = ".flags"]
+#[link_section = ".flags_relocated"]
 static BOOTLOADER_FLAGS: [u8; 36] = {
     let mut f = [0u8; 36];
     // Version "0.1.0"
@@ -123,10 +132,14 @@ static BOOTLOADER_FLAGS: [u8; 36] = {
     f
 };
 
-/// Board attributes baked into flash at _attributes_address (0x600).
+/// Board attributes baked into flash at _relocated_attributes_address (0xE200).
 /// Each attribute: 8-byte key (null-padded) | 1-byte value length | 55-byte value.
+///
+/// Only the first four slots are populated here; the linker zero-fills the rest
+/// of the sixteen, which read back as empty. Reflashing the bootloader restores
+/// these defaults, so anything set over the bus is lost on the next reflash.
 #[used]
-#[link_section = ".attributes"]
+#[link_section = ".attributes_relocated"]
 static BOARD_ATTRIBUTES: [u8; 256] = {
     let mut d = [0u8; 256];
     // Attribute 0: board = "samv71xplained"
@@ -423,11 +436,15 @@ pub unsafe fn main() {
 
     let bootloader_enterer = static_init!(
         bootloader::bootloader::BootloaderEnterer<'static>,
-        bootloader::bootloader::BootloaderEnterer::new(
+        bootloader::bootloader::BootloaderEnterer::new_with_flags(
             bootloader_entry,
             bootloader_jumper,
             bootloader_notifier,
             0x0001_0000, // kernel region start; see layout.ld
+            // Must be the relocated flags, not the linker's default at 0x400:
+            // that region is zeroed on this board, so reading the start address
+            // from it yields 0 and the bootloader silently never jumps.
+            unsafe { (&_relocated_flags_address as *const u8) as u32 },
         )
     );
 
@@ -651,18 +668,21 @@ pub unsafe fn main() {
                 flash_passthrough::Sam71FlashDirect,
             >,
         >,
-        bootloader::bootloader::Bootloader::new(
+        bootloader::bootloader::Bootloader::new_with_table(
             uart_transport,
             flash_for_tockloader,
             &bootloader_exit,
             bl_page_buf,
             &mut bootloader::bootloader::BUF,
             // Refuse writes and erases below the kernel: the whole 64 KB rom
-            // region is the bootloader's, including the vector table, the
-            // flags at 0x400 and the attribute table at 0x600. The UDS server
-            // uses the same floor (see the design document, sections 13.4,
-            // 13.5 and 14).
+            // region is the bootloader's, including the vector table and the
+            // attribute table at 0xE000. The UDS server uses the same floor
+            // (see the design document, sections 13.4, 13.5 and 14).
             0x0001_0000,
+            // This board moved its table out of the block holding its own code
+            // so that it can be rewritten at runtime; see layout.ld.
+            unsafe { (&_relocated_flags_address as *const u8) as usize },
+            unsafe { (&_relocated_attributes_address as *const u8) as usize },
         )
     );
 
@@ -706,13 +726,12 @@ pub unsafe fn main() {
             0x0020_0000, // end of the 2 MB flash alias
             // The attribute table and the flags. Both sit below the write floor
             // and so are reachable only through their DIDs, never by address.
-            unsafe { (&_attributes_address as *const u8) as u32 },
-            unsafe { (&_flags_address as *const u8) as u32 },
-            // End of the running bootloader. On this layout the attribute table
-            // shares an erase block with the vector table and the first pages of
-            // .text, so writes to it are refused: erasing that block deletes the
-            // code doing the erasing. Moving the table above this line is what
-            // would turn attribute writes on.
+            unsafe { (&_relocated_attributes_address as *const u8) as u32 },
+            unsafe { (&_relocated_flags_address as *const u8) as u32 },
+            // End of the running bootloader. A staged rewrite of any erase block
+            // below this is refused, because erasing it would delete the code
+            // doing the erasing. The table sits at 0xE000, well above, which is
+            // what makes attribute writes possible at all -- see layout.ld.
             unsafe { (&_etext as *const u8) as u32 },
         )
     );
