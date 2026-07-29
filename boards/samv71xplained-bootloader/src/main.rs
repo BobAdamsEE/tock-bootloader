@@ -177,6 +177,148 @@ fn bootloader_exit() {
     unsafe { cortexm7::scb::reset(); }
 }
 
+/// How long the bootloader listens on CAN before jumping to the kernel.
+///
+/// This is the escape hatch for a board whose applications cannot be reached.
+/// Handover into the bootloader normally goes through the `uds` application, so
+/// erasing it, replacing it with a broken one, or invalidating its signature
+/// all leave the board booting happily with nothing listening -- and, before
+/// this window existed, needing a debugger. Sections 20.3 and 21.3 of the
+/// design document are both instances of exactly that.
+///
+/// 300 ms is a compromise. It is long enough for a host that is already
+/// hammering the bus to land a frame inside it, and short enough not to be
+/// noticed on a board that boots in seconds. It is paid on *every* boot,
+/// including healthy ones, which is the price of the escape hatch being
+/// available when it is needed rather than when it was anticipated.
+const CAN_ENTRY_WINDOW_MS: u32 = 300;
+
+/// TC0 runs from the 32 kHz slow clock.
+const TC_TICKS_PER_SECOND: u32 = 32_768;
+
+/// What has to arrive to hold the board in the bootloader.
+///
+/// A single-frame ISO-TP `DiagnosticSessionControl(programming)` -- the same
+/// request that asks the *application* to hand over, so the knock and the
+/// normal path mean the same thing to a tester. Requiring a specific payload
+/// rather than any frame on the request identifier keeps ordinary traffic, and
+/// a tester probing with `TesterPresent`, from wedging the board in the
+/// bootloader by accident.
+const CAN_KNOCK: [u8; 3] = [0x02, 0x10, 0x02];
+
+/// Configure MCAN1 for this board: 500 kbit/s arbitration, 2 Mbit/s data,
+/// normal mode, and the acceptance filter for our request identifier.
+///
+/// Shared by the entry window and the ISO-TP transport, which must agree: a
+/// window that listened with different bit timing would answer nothing and
+/// look like a hardware fault.
+fn configure_mcan(mcan: &samv71q21b::mcan::Mcan) {
+    use kernel::hil::can::{Configure, ConfigureFd, Filter};
+
+    // Must be set while the peripheral is still Disabled. Without it the
+    // controller abandons a frame after one lost arbitration, which on a busy
+    // bus means requests silently vanish.
+    let _ = mcan.set_automatic_retransmission(true);
+    let _ = mcan.set_bitrate(500_000);
+
+    // CAN FD: 500 kbit/s arbitration, 2 Mbit/s data phase.
+    //
+    // PCK5 is 20 MHz, so 2 Mbit/s is 10 time quanta. Segments are written in
+    // the register's "minus one" encoding, hence 6 and 1 for 7 and 2:
+    //
+    //   1 (sync) + 7 (seg1) + 2 (seg2) = 10 tq  ->  20 MHz / 10 = 2 Mbit/s
+    //   sample point (1 + 7) / 10 = 80%
+    //
+    // 80% rather than the arbitration phase's 87.5% because the data phase has
+    // no arbitration to resolve and a slightly earlier sample buys tolerance to
+    // the transceiver loop delay. Setting this is also what puts the driver
+    // into FD mode -- there is no separate switch.
+    let _ = ConfigureFd::set_payload_bit_timing(
+        mcan,
+        kernel::hil::can::BitTiming {
+            segment1: 6,
+            segment2: 1,
+            // M_CAN folds propagation delay into DTSEG1; there is no separate
+            // field in DBTP, so this stays zero and the delay is already
+            // accounted for in segment1 above.
+            propagation: 0,
+            sync_jump_width: 0,
+            baud_rate_prescaler: 0,
+        },
+    );
+
+    let _ = mcan.set_operation_mode(kernel::hil::can::OperationMode::Normal);
+
+    // Accept the physical request identifier addressed to this node. 29-bit
+    // normal fixed addressing: 0x18DA<target><source>, so 0x18DA41F1 is
+    // "tester 0xF1 -> target 0x41". Deliberately not an OBD-II legislated
+    // address: this board transmits as a tester at 0x18DB33F1 when running the
+    // kernel, and answering the legislated addresses would collide with real
+    // ECUs.
+    let _ = mcan.enable_filter(kernel::hil::can::FilterParameters {
+        number: 4,
+        scale_bits: kernel::hil::can::ScaleBits::Bits32,
+        identifier_mode: kernel::hil::can::IdentifierMode::List,
+        fifo_number: 0,
+        id: kernel::hil::can::Id::Extended(CAN_REQUEST_ID),
+        mask: 0x1FFF_FFFF,
+    });
+}
+
+/// Listen on CAN for `CAN_ENTRY_WINDOW_MS`; return whether anyone knocked.
+///
+/// Polled rather than interrupt-driven on purpose: this runs before
+/// `kernel_loop`, so nothing services an interrupt and the receive callbacks
+/// would never fire. `Mcan::poll_receive` reads the same FIFO the callback path
+/// reads, and reception into that FIFO depends on the filters rather than on
+/// interrupt enables.
+///
+/// Leaves the controller back in init mode either way. On the jump path that
+/// matters: the kernel configures MCAN1 from scratch and would find a
+/// half-configured peripheral otherwise. On the stay path the transport
+/// reconfigures it a moment later, so the extra cycle costs nothing.
+fn can_entry_requested(
+    mcan: &samv71q21b::mcan::Mcan,
+    tc: &samv71q21b::tc::Tc<'static>,
+) -> bool {
+    use kernel::hil::time::{Counter, Ticks, Time};
+
+    configure_mcan(mcan);
+    if mcan.hw_enable_blocking().is_err() {
+        // No bus, no escape hatch -- but never a reason not to boot.
+        mcan.hw_disable_blocking();
+        return false;
+    }
+
+    let _ = tc.start();
+    let started = tc.now();
+    let window = (CAN_ENTRY_WINDOW_MS * TC_TICKS_PER_SECOND) / 1000;
+
+    let mut knocked = false;
+    loop {
+        if let Some((id, data, len)) = mcan.poll_receive() {
+            // `can::Id` has no `PartialEq`, hence the match rather than `==`.
+            let ours = matches!(
+                id,
+                kernel::hil::can::Id::Extended(value) if value == CAN_REQUEST_ID
+            );
+            if ours && len >= CAN_KNOCK.len() && data[..CAN_KNOCK.len()] == CAN_KNOCK {
+                knocked = true;
+                break;
+            }
+        }
+        // Wrapping subtraction: TC0 is 32 kHz and the counter is 16 bits wide
+        // without its overflow interrupt being serviced here, so it wraps every
+        // two seconds. Any window shorter than that measures correctly.
+        if tc.now().into_u32().wrapping_sub(started.into_u32()) >= window {
+            break;
+        }
+    }
+
+    mcan.hw_disable_blocking();
+    knocked
+}
+
 /// Static page buffer for the slot copier. One buffer, taken and returned per
 /// page; see `kernel_slot`.
 static mut ROLLBACK_PAGE: samv71q21b::efc::Sam71Page =
@@ -471,6 +613,11 @@ pub unsafe fn main() {
         | bootloader::kernel_integrity::Verdict::NoDescriptor => {}
     }
 
+    // Listen briefly for someone asking to stay, before deciding to jump.
+    if can_entry_requested(&peripherals.mcan1, &peripherals.tc0) {
+        gpbr.set(samv71q21b::gpbr::GpbrIndex::Gpbr7, 0x90);
+    }
+
     // Decides: jump to kernel, or stay in bootloader.
     bootloader_enterer.check();
 
@@ -522,62 +669,10 @@ pub unsafe fn main() {
     // It does inherit the acceptance-filter work done for the kernel: with GFC
     // set to reject unmatched frames, the filter installed here defines
     // reception.
-    {
-        use kernel::hil::can::{Configure, Filter};
-
-        // Must be set while the peripheral is still Disabled. Without it the
-        // controller abandons a frame after one lost arbitration, which on a
-        // busy bus means requests silently vanish.
-        let _ = peripherals.mcan1.set_automatic_retransmission(true);
-        let _ = peripherals.mcan1.set_bitrate(500_000);
-
-        // CAN FD: 500 kbit/s arbitration, 2 Mbit/s data phase.
-        //
-        // PCK5 is 20 MHz, so 2 Mbit/s is 10 time quanta. Segments are written
-        // in the register's "minus one" encoding, hence 6 and 1 for 7 and 2:
-        //
-        //   1 (sync) + 7 (seg1) + 2 (seg2) = 10 tq  ->  20 MHz / 10 = 2 Mbit/s
-        //   sample point (1 + 7) / 10 = 80%
-        //
-        // 80% rather than the arbitration phase's 87.5% because the data phase
-        // has no arbitration to resolve and a slightly earlier sample buys
-        // tolerance to the transceiver loop delay. Setting this is also what
-        // puts the driver into FD mode -- there is no separate switch.
-        let _ = kernel::hil::can::ConfigureFd::set_payload_bit_timing(
-            &peripherals.mcan1,
-            kernel::hil::can::BitTiming {
-                segment1: 6,
-                segment2: 1,
-                // M_CAN folds propagation delay into DTSEG1; there is no
-                // separate field in DBTP, so this stays zero and the delay is
-                // already accounted for in segment1 above.
-                propagation: 0,
-                sync_jump_width: 0,
-                baud_rate_prescaler: 0,
-            },
-        );
-
-        let _ = peripherals
-            .mcan1
-            .set_operation_mode(kernel::hil::can::OperationMode::Normal);
-
-        // Accept the physical request identifier addressed to this node.
-        // 29-bit normal fixed addressing: 0x18DA<target><source>, so
-        // 0x18DA41F1 is "tester 0xF1 -> target 0x41". Deliberately not an
-        // OBD-II legislated address: this board transmits as a tester at
-        // 0x18DB33F1 when running the kernel, and answering the legislated
-        // addresses would collide with real ECUs.
-        let _ = peripherals
-            .mcan1
-            .enable_filter(kernel::hil::can::FilterParameters {
-                number: 4,
-                scale_bits: kernel::hil::can::ScaleBits::Bits32,
-                identifier_mode: kernel::hil::can::IdentifierMode::List,
-                fifo_number: 0,
-                id: kernel::hil::can::Id::Extended(CAN_REQUEST_ID),
-                mask: 0x1FFF_FFFF,
-            });
-    }
+    // Same configuration the entry window used a moment ago, applied again
+    // because the window puts the controller back in init mode on its way
+    // out. Shared so the two cannot disagree about bit timing.
+    configure_mcan(&peripherals.mcan1);
 
     let isotp_frame = static_init!(
         [u8; kernel::hil::can::FD_CAN_PACKET_SIZE],
