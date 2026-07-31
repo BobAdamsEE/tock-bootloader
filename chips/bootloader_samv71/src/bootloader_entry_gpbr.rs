@@ -3,12 +3,14 @@
 //!
 //! GPBR7 is preserved across soft resets, allowing the running kernel to write
 //! a magic value and then reset in order to reboot into the bootloader.
-//! A double-reset detection scheme (using the last word of SRAM) is also
-//! included as a fallback for boards where software-initiated resets are not
-//! convenient.
+//!
+//! Everything decided here is decided from the backup registers alone. The
+//! conditions that have to *observe* something first -- `FLASH_EN`, a CAN
+//! knock, a double-reset -- live in the board's `main.rs`, because each needs a
+//! peripheral and a real timebase, and each ends by writing the same GPBR7
+//! magic this reads. That keeps one meaning of "stay resident" and leaves this
+//! file with no notion of how long anything takes.
 
-use kernel::utilities::cells::VolatileCell;
-use kernel::utilities::StaticRef;
 use samv71q21b::gpbr::GpbrIndex;
 
 /// Magic value written to GPBR7 by the kernel to request a reboot into the
@@ -32,10 +34,6 @@ const DFU_MAGIC_TOCK_BOOTLOADER1: u32 = 0x90;
 /// alternate kernel / bootloader forever. It is gated behind
 /// `chain_next_bootloader` for that reason; see [`BootloaderEntryGpRegRet::new`].
 const DFU_MAGIC_TOCK_BOOTLOADER2: u32 = 0x91;
-
-/// Magic value stored in the double-reset RAM location during the window after
-/// a first reset. Taken from the Adafruit nRF52 bootloader.
-const DFU_DBL_RESET_MAGIC: u32 = 0x5A1AD5;
 
 /// Boots that may be attempted without the kernel reporting itself healthy
 /// before the bootloader stops trying.
@@ -69,14 +67,8 @@ pub fn clear_boot_attempts(gpbr: &samv71q21b::gpbr::Gpbr) {
     gpbr.set(BOOT_ATTEMPT_INDEX, 0);
 }
 
-/// Scratch word at the very end of SAMV71Q21B SRAM (384 KB: 0x20400000–0x2045FFFF).
-/// Must be reserved by the linker script so it is not zeroed at startup.
-const DOUBLE_RESET_MEMORY_LOCATION: StaticRef<VolatileCell<u32>> =
-    unsafe { StaticRef::new(0x2045FFF0 as *const VolatileCell<u32>) };
-
 pub struct BootloaderEntryGpRegRet {
     samv71_gpbr: &'static samv71q21b::gpbr::Gpbr,
-    double_reset: StaticRef<VolatileCell<u32>>,
     /// Whether to write [`DFU_MAGIC_TOCK_BOOTLOADER2`] when jumping out of the
     /// bootloader. Only correct when the jump target is a second, chained
     /// bootloader that will consume the value in the same boot.
@@ -92,7 +84,6 @@ impl BootloaderEntryGpRegRet {
     pub fn new(samv71_gpbr: &'static samv71q21b::gpbr::Gpbr) -> BootloaderEntryGpRegRet {
         BootloaderEntryGpRegRet {
             samv71_gpbr,
-            double_reset: DOUBLE_RESET_MEMORY_LOCATION,
             chain_next_bootloader: false,
         }
     }
@@ -106,7 +97,6 @@ impl BootloaderEntryGpRegRet {
     pub fn new_chained(samv71_gpbr: &'static samv71q21b::gpbr::Gpbr) -> BootloaderEntryGpRegRet {
         BootloaderEntryGpRegRet {
             samv71_gpbr,
-            double_reset: DOUBLE_RESET_MEMORY_LOCATION,
             chain_next_bootloader: true,
         }
     }
@@ -140,21 +130,14 @@ impl bootloader::interfaces::BootloaderEntry for BootloaderEntryGpRegRet {
             return true;
         }
 
-        // Double-reset: if the magic is already in RAM, a second reset happened
-        // within the detection window.
-        if self.double_reset.get() == DFU_DBL_RESET_MAGIC {
-            self.double_reset.set(0);
-            return true;
-        }
-
-        // First reset of a potential double-reset: set the magic and spin.
-        // If a second reset arrives before the loop exits, the check above will
-        // fire on re-entry.
-        self.double_reset.set(DFU_DBL_RESET_MAGIC);
-        for _ in 0..2_000_000 {
-            cortexm7::support::nop();
-        }
-        self.double_reset.set(0);
+        // No double-reset check here: the board's `main.rs` owns that, along
+        // with FLASH_EN and the CAN window, and writes GPBR7 above if it fires.
+        // It used to live here as a busy loop of 2,000,000 nops, which is a
+        // duration only on the part it was written for -- the same source line
+        // meant ~150 ms on a 64 MHz Cortex-M4 and ~15 ms on this 300 MHz
+        // Cortex-M7, which is short enough that nobody could press the button
+        // twice fast enough. Measuring against a real timebase needs a timer,
+        // and a timer is a peripheral this file has no business holding.
 
         // Write the chaining magic so a second bootloader (if flashed) will
         // stay -- but only when there actually is one. Otherwise clear GPBR7,

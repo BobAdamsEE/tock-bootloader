@@ -5,9 +5,17 @@
 //!   - EDBG UART: USART1, RXD=PA21 (periph A), TXD=PB4 (periph D), 115200 baud
 //!   - 2 MB internal flash (512-byte pages), 384 KB SRAM at 0x20400000
 //!
-//! Bootloader entry (evaluated in order):
-//!   1. GPBR7 >= 0x90: kernel explicitly requested reboot into bootloader.
-//!   2. Double-reset: two resets within the detection window.
+//! Bootloader entry. The first four conditions set the entry magic in GPBR7;
+//! the last two are read straight out of the backup registers by
+//! `BootloaderEntryGpRegRet`. Any one of them holds the board here.
+//!
+//!   1. The kernel failed its integrity check and no backup was worth
+//!      restoring -- see `kernel_integrity` and `try_rollback`.
+//!   2. `FLASH_EN` held low -- see `FLASH_EN_PIN`.
+//!   3. Two NRST presses inside `DOUBLE_RESET_WINDOW_MS`.
+//!   4. A CAN knock inside `CAN_ENTRY_WINDOW_MS` -- see `CAN_KNOCK`.
+//!   5. GPBR7 >= 0x90: the kernel, or a debugger, asked for the bootloader.
+//!   6. GPBR6 >= 3: three boots without the kernel reporting itself healthy.
 
 #![no_std]
 #![cfg_attr(not(doc), no_main)]
@@ -183,15 +191,58 @@ fn bootloader_exit() {
 /// a board with a `FLASH_EN` pin should use: the pin does the same job for the
 /// price of a register read instead of a third of a second on every boot.
 ///
-/// This board keeps a window because it has no `FLASH_EN` line wired, so the
-/// pin below always reads its pull-up and never asks to stay. 100 ms is ample
-/// against a host knocking every 10 ms -- roughly ten chances to land a frame
-/// -- and a third of the original cost.
+/// This board declares the pin below so the production path stays exercised,
+/// but has no `FLASH_EN` line actually wired: PE3 reads its own pull-up and
+/// never asks to stay. So the window is what does the work here, and it stays
+/// at 100 ms -- ample against a host knocking every 10 ms, roughly ten chances
+/// to land a frame, and a third of the original cost.
 ///
 /// The window and the pin are independent on purpose. The window needs the CAN
 /// subsystem to be working, which is precisely what may not be true; the pin
 /// does not care.
 const CAN_ENTRY_WINDOW_MS: u32 = 100;
+
+/// How long after an NRST press a second press still counts as a double-reset.
+///
+/// **Zero disables it entirely.** Paid only on a reset that came from the pin
+/// -- see `double_reset_requested` -- so power-up, watchdog recovery and the
+/// software reset behind `ECUReset` all boot without it. That gate is what
+/// makes half a second affordable, and half a second is what the scheme was
+/// designed around: the Adafruit nRF52 bootloader this descends from uses
+/// exactly that, and much less cannot be hit by hand.
+///
+/// It replaced a fixed 2,000,000-iteration nop loop carried over from that
+/// same nRF52 code, which is the bug worth remembering: a cycle count is not a
+/// duration. On the 64 MHz Cortex-M4 it was written for it came to roughly
+/// 150 ms. On this 300 MHz Cortex-M7, dual-issuing the nop against the loop
+/// counter and predicting the branch, it came to something on the order of
+/// 15 ms -- still there, still correct, and entirely unreachable with a finger.
+///
+/// Must stay under two seconds; see `tc_elapsed`.
+const DOUBLE_RESET_WINDOW_MS: u32 = 500;
+
+/// Reset Controller status register, and the value its `RSTTYP` field takes
+/// for a user reset -- a high-to-low edge on NRST, which here means the button.
+///
+/// The others are 0 general (power-up), 1 backup, 2 watchdog and 3 software.
+/// None of them is somebody standing at the board asking for the bootloader,
+/// so none of them arms the window.
+///
+/// Reading `RSTC_SR` clears its `URSTS` bit as a side effect. Nothing else in
+/// this bootloader reads that register, so there is nothing to disturb.
+const RSTC_SR: u32 = 0x400E_1804;
+const RSTTYP_USER_RESET: u32 = 4;
+
+/// Word of SRAM holding `DOUBLE_RESET_MAGIC` while the window is open.
+///
+/// The linker reserves the top 16 bytes of SRAM for it -- the `retained`
+/// region in layout.ld -- so startup does not zero it and it survives the
+/// reset it exists to detect.
+const DOUBLE_RESET_LOCATION: u32 = 0x2045_FFF0;
+
+/// Value written there while the window is open. Taken, along with the scheme,
+/// from the Adafruit nRF52 bootloader.
+const DOUBLE_RESET_MAGIC: u32 = 0x005A_1AD5;
 
 /// Whether this board has a `FLASH_EN` line, and which pin it is.
 ///
@@ -326,6 +377,82 @@ fn flash_en_asserted(port: &samv71q21b::gpio::PortE<'static>, pin_index: usize) 
     low == FLASH_EN_ASSERTED_LOW_COUNT
 }
 
+/// TC0 ticks elapsed since `started`, correct across the counter's rollover.
+///
+/// `Tc` presents a 32-bit counter, but its high half only advances inside the
+/// overflow interrupt -- and nothing services interrupts here, before
+/// `kernel_loop`. So throughout the entry windows the value really is the
+/// 16-bit hardware counter, which rolls over about every two seconds at
+/// 32 kHz. Subtracting those as `u32` yields a number near 2^32 the moment it
+/// rolls, which reads as "window expired" and cuts the window short: a one in
+/// twenty chance for the CAN window, one in four for the longer double-reset
+/// one. Subtracting as `u16` is right either way, because the low half is the
+/// hardware counter whether or not the high half is moving.
+///
+/// The ceiling this leaves is one rollover: any window under two seconds
+/// measures correctly, and nothing here wants more.
+fn tc_elapsed(tc: &samv71q21b::tc::Tc<'static>, started: u32) -> u32 {
+    use kernel::hil::time::{Ticks, Time};
+
+    (tc.now().into_u32() as u16).wrapping_sub(started as u16) as u32
+}
+
+/// Did the operator press reset twice in quick succession?
+///
+/// A word of SRAM survives the reset. The first press finds it empty, writes
+/// the magic and waits; if a second press lands inside the window the board
+/// comes back up with the magic still there and this returns true on the way
+/// through. If the window closes first the word is cleared and the board boots
+/// normally, so a single press costs the window and nothing else.
+///
+/// Gated on `RSTTYP` so only a press of NRST takes part. Without that gate the
+/// window would be added to every boot -- including the software reset that
+/// ends every `uds_flash.py --reset`, and the watchdog resets the boot-attempt
+/// counter depends on -- half a second each, waiting for a signal that could
+/// not have been sent. The gate is what buys a window long enough to use.
+///
+/// Unlike the CAN window this needs no peripheral beyond the timer, and unlike
+/// `FLASH_EN` it needs no wiring. It is the escape hatch that works on a bare
+/// board with nothing attached.
+fn double_reset_requested(tc: &samv71q21b::tc::Tc<'static>) -> bool {
+    use kernel::hil::time::{Counter, Ticks, Time};
+
+    if DOUBLE_RESET_WINDOW_MS == 0 {
+        return false;
+    }
+
+    // Nothing but NRST takes part in this, on either side of the pair. Testing
+    // that before reading the scratch word is what makes the word trustworthy:
+    // SRAM contents after a power cycle are undefined, and a stale magic left
+    // by a window that was interrupted by pulling the plug would otherwise
+    // send the next power-up into the bootloader for no reason.
+    let rsttyp = (unsafe { core::ptr::read_volatile(RSTC_SR as *const u32) } >> 8) & 0x7;
+    if rsttyp != RSTTYP_USER_RESET {
+        return false;
+    }
+
+    let scratch = DOUBLE_RESET_LOCATION as *mut u32;
+
+    // A second press, inside the window the last one opened. Consume the magic
+    // so that a third reset starts a fresh pair rather than latching here.
+    if unsafe { core::ptr::read_volatile(scratch) } == DOUBLE_RESET_MAGIC {
+        unsafe { core::ptr::write_volatile(scratch, 0) };
+        return true;
+    }
+
+    // First press: arm, and hold the boot for the window. A reset arriving
+    // before it closes is caught by the check above on the way back in.
+    unsafe { core::ptr::write_volatile(scratch, DOUBLE_RESET_MAGIC) };
+
+    let _ = tc.start();
+    let started = tc.now().into_u32();
+    let window = (DOUBLE_RESET_WINDOW_MS * TC_TICKS_PER_SECOND) / 1000;
+    while tc_elapsed(tc, started) < window {}
+
+    unsafe { core::ptr::write_volatile(scratch, 0) };
+    false
+}
+
 /// Listen on CAN for `CAN_ENTRY_WINDOW_MS`; return whether anyone knocked.
 ///
 /// Polled rather than interrupt-driven on purpose: this runs before
@@ -356,7 +483,7 @@ fn can_entry_requested(
     }
 
     let _ = tc.start();
-    let started = tc.now();
+    let started = tc.now().into_u32();
     let window = (CAN_ENTRY_WINDOW_MS * TC_TICKS_PER_SECOND) / 1000;
 
     let mut knocked = false;
@@ -372,10 +499,7 @@ fn can_entry_requested(
                 break;
             }
         }
-        // Wrapping subtraction: TC0 is 32 kHz and the counter is 16 bits wide
-        // without its overflow interrupt being serviced here, so it wraps every
-        // two seconds. Any window shorter than that measures correctly.
-        if tc.now().into_u32().wrapping_sub(started.into_u32()) >= window {
+        if tc_elapsed(tc, started) >= window {
             break;
         }
     }
@@ -681,16 +805,25 @@ pub unsafe fn main() {
         | bootloader::kernel_integrity::Verdict::NoDescriptor => {}
     }
 
-    // Two ways to ask the bootloader to stay, checked cheapest first.
+    // Three ways to ask the bootloader to stay, checked cheapest first, and all
+    // ending in the same GPBR7 magic -- so there is still one way to say "stay
+    // resident" and the entry check clears it as usual.
     //
-    // The FLASH_EN pin is a register read; the CAN window costs real time on
-    // every boot. A board with the pin wired sets CAN_ENTRY_WINDOW_MS to 0 and
-    // pays neither. Both end in the same GPBR7 magic, so there is still one way
-    // to say "stay resident" and the entry check clears it as usual.
+    // The FLASH_EN pin is a register read. The other two cost real time on
+    // every boot, which is the whole reason they are ordered this way: a board
+    // with the pin wired sets both windows to 0 and pays nothing.
+    //
+    // Double-reset before the CAN window because catching one is a single word
+    // of SRAM, so a double-tap enters the bootloader immediately instead of
+    // sitting through a CAN window nobody is knocking on. On the other path it
+    // costs its window before the CAN one opens, which `can_knock.py` does not
+    // care about -- it floods continuously, so a window opening 500 ms later is
+    // still a window it lands in.
     let asked_to_stay = match FLASH_EN_PIN {
         Some(index) => flash_en_asserted(&peripherals.pe, index),
         None => false,
-    } || can_entry_requested(&peripherals.mcan1, &peripherals.tc0);
+    } || double_reset_requested(&peripherals.tc0)
+        || can_entry_requested(&peripherals.mcan1, &peripherals.tc0);
 
     if asked_to_stay {
         gpbr.set(samv71q21b::gpbr::GpbrIndex::Gpbr7, 0x90);
