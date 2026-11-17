@@ -2,7 +2,7 @@ Chameleon Tock Bootloader
 =========================
 
 Bootloader for the Chameleon board (PCA-0001-01). **This is a draft.** It builds
-against `tock-2.3`, but nothing here has run on Chameleon hardware.
+against Tock 2.3 (the `tock` submodule), but nothing here has run on Chameleon hardware.
 
 The boot-entry logic is shared with the Xplained board through
 `chips/bootloader_samv71/src/entry.rs`, as is the flash adapter. This board's
