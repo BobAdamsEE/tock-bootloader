@@ -6,8 +6,6 @@ use kernel::ErrorCode;
 
 use kernel::hil;
 use kernel::utilities::cells::TakeCell;
-use kernel::utilities::cells::VolatileCell;
-use kernel::utilities::StaticRef;
 
 use crate::bootloader_crc;
 use crate::transport::{BootloaderTransport, BootloaderTransportClient};
@@ -160,10 +158,8 @@ impl<'a> BootloaderEnterer<'a> {
         // Address of the start address in the flags region is 32 bytes from the start.
         let start_address_memory_location = self.bootloader_flags_address + 32;
 
-        let start_address_ptr: StaticRef<VolatileCell<u32>> =
-            unsafe { StaticRef::new(start_address_memory_location as *const VolatileCell<u32>) };
-
-        let start_address = start_address_ptr.get();
+        let start_address =
+            unsafe { core::ptr::read_volatile(start_address_memory_location as *const u32) };
 
         // Validate start_address before dereferencing it. The kernel lives
         // above the bootloader's own region and below the end of flash.
@@ -182,9 +178,8 @@ impl<'a> BootloaderEnterer<'a> {
         // Read the kernel's initial SP from its vector table to detect a kernel
         // region that exists in the address space but has not been programmed.
         // Erased flash reads as 0xFFFFFFFF which is not a valid stack pointer.
-        let kernel_sp_ptr: StaticRef<VolatileCell<u32>> =
-            unsafe { StaticRef::new(start_address as *const VolatileCell<u32>) };
-        if kernel_sp_ptr.get() == 0xFFFF_FFFF {
+        let kernel_sp = unsafe { core::ptr::read_volatile(start_address as *const u32) };
+        if kernel_sp == 0xFFFF_FFFF {
             self.active_notifier.active();
             return;
         }

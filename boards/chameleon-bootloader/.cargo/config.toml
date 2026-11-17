@@ -1,0 +1,13 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+rustflags = [
+  "-C", "linker=rust-lld",
+  "-C", "linker-flavor=ld.lld",
+  "-C", "relocation-model=static",
+  "-C", "symbol-mangling-version=v0",
+]
+
+[unstable]
+build-std = ["core"]

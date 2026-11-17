@@ -4,6 +4,6 @@ version = "0.1.0"
 authors = ["Tock Project Developers <tock-dev@googlegroups.com>"]
 
 [dependencies]
-kernel = { path = "../../../tock/kernel" }
+kernel = { path = "../../../tock-2.3/kernel" }
 
 bootloader = { path = "../../bootloader" }

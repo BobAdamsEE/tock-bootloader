@@ -5,8 +5,8 @@ authors = ["Bob Adams <bob@bobadams5.com>"]
 edition = "2021"
 
 [dependencies]
-kernel     = { path = "../../../tock/kernel" }
-samv71q21b = { path = "../../../tock/chips/samv71q21b" }
-cortexm7   = { path = "../../../tock/arch/cortex-m7" }
+kernel     = { path = "../../../tock-2.3/kernel" }
+samv71q21b = { path = "../../../tock-2.3/chips/samv71q21b" }
+cortexm7   = { path = "../../../tock-2.3/arch/cortex-m7" }
 
 bootloader = { path = "../../bootloader" }

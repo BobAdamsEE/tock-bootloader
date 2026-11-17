@@ -5,7 +5,7 @@ authors = ["Tock Project Developers <tock-dev@googlegroups.com>"]
 edition = "2021"
 
 [dependencies]
-kernel = { path = "../../tock/kernel" }
+kernel = { path = "../../tock-2.3/kernel" }
 
 tock-bootloader-protocol = { path = "../protocol" }
 
